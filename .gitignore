@@ -20,3 +20,9 @@ Thumbs.db
 
 # Node dependencies
 node_modules/
+
+# Runtime logs (agent.log and similar)
+*.log
+
+# Baseline rebuilt by agent.py at every start
+agent_baseline.json

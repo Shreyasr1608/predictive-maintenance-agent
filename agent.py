@@ -45,7 +45,7 @@ import requests
 
 from baseline import build_from_server, load_baseline, save_baseline
 from common import DEFAULT_BASE_URL, SimulatorError, check_reading, parse_timestamp
-from detectors import detect_drift, detect_patterns, detect_spikes
+from detector import detect_drift, detect_patterns, detect_spikes
 
 log = logging.getLogger("agent")
 
@@ -415,4 +415,210 @@ def run_machine(base_url, monitor, stop_event, dry_run, explain):
                 log.warning("machine=%s stream closed by the server", monitor.machine_id)
         except requests.exceptions.RequestException as exc:
             if not stop_event.is_set():
-                log.warning("machine=
+                log.warning("machine=%s stream error: %s", monitor.machine_id, exc)
+                monitor.stats["stream_errors"] += 1
+        except Exception:
+            # Last resort. A bug, or an answer we did not expect, must never kill this machine's
+            # thread (or the other machines). Log the full traceback, then reconnect as usual.
+            monitor.stats["unexpected_errors"] += 1
+            log.exception("machine=%s unexpected error; will reconnect", monitor.machine_id)
+
+        if stop_event.is_set():
+            break
+        # Wait longer after each failure in a row: 1, 2, 4, 8, 15, then 30 s again and again.
+        # `attempt` goes back to 0 as soon as data flows again (see above).
+        delay = RECONNECT_DELAYS_S[min(attempt, len(RECONNECT_DELAYS_S) - 1)]
+        attempt += 1
+        monitor.stats["reconnects"] += 1
+        log.info("machine=%s reconnecting in %s s (attempt %d)", monitor.machine_id, delay, attempt)
+        stop_event.wait(delay)  # returns at once if the agent is stopping
+    log.info("machine=%s monitor stopped", monitor.machine_id)
+
+
+# ---------------------------------------------------------------------------
+# I/O: running all machines together
+# ---------------------------------------------------------------------------
+# When stopping, how long to wait for the machine threads in total. A thread can be waiting up
+# to STREAM_READ_TIMEOUT_S (10 s) for the next stream line, or finishing a POST that may take up
+# to POST_TIMEOUT_S (10 s). (Moves to config.py in Phase 7, like the settings at the top.)
+SHUTDOWN_WAIT_S = 15
+# How often the main thread wakes up to check the --duration deadline. Short naps also make
+# Ctrl+C work promptly on Windows, where a long blocking wait can delay it.
+MAIN_LOOP_NAP_S = 0.5
+
+
+def run_agent(base_url, baseline, dry_run=False, duration=None, explain=simple_reason):
+    """
+    Monitor every machine in the baseline, one thread per machine, until Ctrl+C, until
+    `duration` seconds (wall clock) have passed, or until every thread has stopped.
+    explain(assessment) -> str builds the alert text (Phase 5 will pass a richer one).
+    Returns {machine_id: MachineMonitor}, so the caller can print a summary (and tests can
+    look at the counters).
+    """
+    stop_event = threading.Event()  # the shared "please stop" flag that every thread checks
+    monitors = {machine_id: MachineMonitor(machine_id, baseline) for machine_id in baseline["machines"]}
+    threads = []
+    try:
+        for machine_id, monitor in monitors.items():
+            # daemon=True: a thread that is still stuck when the program ends cannot keep the
+            # program alive.
+            thread = threading.Thread(target=run_machine, name=machine_id, daemon=True,
+                                      args=(base_url, monitor, stop_event, dry_run, explain))
+            thread.start()
+            threads.append(thread)
+        log.info("monitoring %d machines: %s", len(threads), ", ".join(monitors))
+
+        deadline = None if duration is None else time.monotonic() + duration
+        while True:
+            if not any(thread.is_alive() for thread in threads):
+                log.error("all machine threads have stopped; ending the run")
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                log.info("duration of %g s reached; stopping", duration)
+                break
+            time.sleep(MAIN_LOOP_NAP_S)
+    except KeyboardInterrupt:
+        # Python delivers Ctrl+C to the main thread only, so it always arrives here.
+        log.info("Ctrl+C received; stopping (this can take a few seconds)")
+    finally:
+        stop_event.set()
+        give_up_at = time.monotonic() + SHUTDOWN_WAIT_S
+        for thread in threads:
+            thread.join(max(0.0, give_up_at - time.monotonic()))
+        still_busy = [thread.name for thread in threads if thread.is_alive()]
+        if still_busy:
+            log.warning("threads still busy after %s s, ending without them: %s",
+                        SHUTDOWN_WAIT_S, ", ".join(still_busy))
+    return monitors
+
+
+def print_summary(monitors, dry_run=False):
+    """
+    Log one line of counters per machine (so it reaches both the console and the log file):
+      readings, evaluations   accepted readings, and how often the detectors ran
+      alerts                  alerts sent; in a dry run, alerts that WOULD have been sent
+      malformed, out_of_order rejected stream lines and readings (warnings in the log say why)
+      gaps                    silences longer than MAX_GAP_S between two readings
+      reconnects              times the stream was opened again (or tried) after it ended
+      stream_errors           connection problems: refused, timed out, broken, bad HTTP status
+      unexpected_errors       exceptions caught by the last-resort handler (tracebacks in the log)
+    """
+    keys = ("readings", "evaluations", "alerts", "malformed", "out_of_order", "gaps",
+            "reconnects", "stream_errors", "unexpected_errors")
+    log.info("Summary%s:", " (DRY RUN: 'alerts' are alerts that would have been sent)" if dry_run else "")
+    for machine_id, monitor in monitors.items():
+        log.info("  %-12s %s", machine_id, " ".join(f"{key}={monitor.stats[key]}" for key in keys))
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+def setup_logging(log_file):
+    """
+    Console: INFO and above (one line per evaluation, alerts, connection problems).
+    Log file: DEBUG and above, i.e. also every active evidence item as JSON. The file is
+    appended to, so earlier runs are kept. Raises OSError if the file cannot be opened.
+    """
+    formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")  # may raise OSError
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # handle_result() checks this before writing the JSON evidence lines
+    root.addHandler(file_handler)
+    root.addHandler(console)
+    # requests uses urllib3, which logs every HTTP connection at DEBUG; keep only its warnings.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def prepare_baseline(base_url, saved_path, save_path):
+    """
+    Return the baseline the agent will use.
+      saved_path given : load that file (written earlier by baseline.py or by this agent).
+      otherwise        : rebuild it from the simulator we are about to monitor (its history is
+                         regenerated at every simulator restart) and keep a copy in save_path.
+    Raises SimulatorError, OSError, KeyError, TypeError or ValueError with a readable message.
+    """
+    if saved_path:
+        baseline = load_baseline(saved_path)
+        machines = baseline.get("machines") if isinstance(baseline, dict) else None
+        if not isinstance(machines, dict) or not machines:
+            raise ValueError(f"{saved_path} is not a baseline file (no 'machines' section)")
+        meta = baseline.get("meta") if isinstance(baseline.get("meta"), dict) else {}
+        log.info("using saved baseline %s (created %s from %s)", saved_path,
+                 meta.get("created_at", "?"), meta.get("source", "?"))
+        return baseline
+
+    log.info("building the baseline from %s (7 days of history per machine)", base_url)
+    baseline = build_from_server(base_url, progress=log.info)
+    try:
+        save_baseline(baseline, save_path)
+        log.info("baseline saved to %s", save_path)
+    except OSError as exc:
+        # The copy is only for inspection and reuse; the agent can run without it.
+        log.warning("could not save the baseline to %s (%s); continuing", save_path, exc)
+    return baseline
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Phase 4: monitor all machines and raise alerts.")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="simulator address")
+    parser.add_argument("--log-file", default="agent.log",
+                        help="full log including the DEBUG evidence, appended (default: agent.log)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="decide and log, but never POST alerts")
+    parser.add_argument("--duration", type=float, metavar="SECONDS",
+                        help="stop by itself after this many seconds (default: run until Ctrl+C)")
+    parser.add_argument("--use-saved-baseline", metavar="FILE",
+                        help="load this baseline file instead of rebuilding it from the simulator")
+    parser.add_argument("--save-baseline", metavar="FILE", default="agent_baseline.json",
+                        help="where the rebuilt baseline is written (default: agent_baseline.json); "
+                             "not used with --use-saved-baseline")
+    args = parser.parse_args(argv)
+    if args.duration is not None and not args.duration > 0:  # "not > 0" also rejects nan
+        parser.error("--duration must be more than 0 seconds")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    base_url = args.base_url.rstrip("/")
+    try:
+        setup_logging(args.log_file)
+    except OSError as exc:
+        print(f"ERROR: cannot open the log file {args.log_file}: {exc}")
+        return 1
+
+    log.info("=" * 70)
+    log.info("agent starting: %s; simulator %s; log file %s",
+             "DRY RUN (alerts are only logged)" if args.dry_run else "LIVE (alerts are POSTed)",
+             base_url, args.log_file)
+    log.info("settings: evaluate every %s s, persistence %s s, cooldown %s s, duration %s",
+             EVAL_INTERVAL_S, PERSISTENCE_S, COOLDOWN_S,
+             f"{args.duration:g} s" if args.duration else "until Ctrl+C")
+    try:
+        baseline = prepare_baseline(base_url, args.use_saved_baseline, args.save_baseline)
+    except (SimulatorError, OSError, KeyError, TypeError, ValueError) as exc:
+        log.error("cannot start: %s: %s", type(exc).__name__, exc)
+        return 1
+    except KeyboardInterrupt:
+        log.warning("interrupted before monitoring started")
+        return 130
+
+    log.warning("REMINDER: close the simulator's browser dashboard. Each extra stream connection "
+                "makes that machine run faster and splits its readings between the clients.")
+    try:
+        monitors = run_agent(base_url, baseline, dry_run=args.dry_run, duration=args.duration)
+    except KeyboardInterrupt:
+        log.warning("interrupted again while stopping; exiting without waiting for the threads")
+        return 130
+    print_summary(monitors, args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
