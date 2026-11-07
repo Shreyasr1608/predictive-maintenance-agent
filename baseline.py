@@ -234,6 +234,34 @@ def build_baseline(histories, nominals, reference_days=REFERENCE_DAYS, source="u
     }
 
 
+def build_from_server(base_url, reference_days=REFERENCE_DAYS, progress=None):
+    """
+    Download /machines and every machine's 7-day history from the simulator, then build the
+    baseline. Used by this script's main() and by agent.py at startup, so the agent always
+    learns from the same server it is about to monitor.
+    progress: optional function that receives short status messages (e.g. print).
+    Raises SimulatorError (cannot reach or bad answer), KeyError/TypeError (unexpected shape)
+    or ValueError (too little data) with a readable message.
+    """
+    machines_data = get_json(base_url, "/machines")
+    histories = {}
+    nominals = {}
+    for machine_id in machines_data["machines"]:
+        # /machines names sensors temp/vib/rpm/current; translate to our field names.
+        nominals[machine_id] = {
+            field: machines_data["baselines"][machine_id][NOMINAL_KEY[field]] for field in SENSOR_FIELDS
+        }
+        readings, n_bad = load_history(base_url, machine_id)
+        if n_bad and progress:
+            progress(f"WARNING: {machine_id}: {n_bad} malformed history readings were skipped")
+        if not readings:
+            raise SimulatorError(f"{machine_id}: no usable history readings")
+        histories[machine_id] = readings
+        if progress:
+            progress(f"loaded {len(readings)} readings for {machine_id}")
+    return build_baseline(histories, nominals, reference_days, source=base_url)
+
+
 # ---------------------------------------------------------------------------
 # Saving, loading, and the lookup detectors will use
 # ---------------------------------------------------------------------------
@@ -369,23 +397,7 @@ def main():
     base_url = args.base_url.rstrip("/")
 
     try:
-        machines_data = get_json(base_url, "/machines")
-        machine_ids = machines_data["machines"]
-        histories = {}
-        nominals = {}
-        for machine_id in machine_ids:
-            # /machines names sensors temp/vib/rpm/current; translate to our field names.
-            nominals[machine_id] = {
-                field: machines_data["baselines"][machine_id][NOMINAL_KEY[field]] for field in SENSOR_FIELDS
-            }
-            readings, n_bad = load_history(base_url, machine_id)
-            if n_bad:
-                print(f"WARNING: {machine_id}: {n_bad} malformed history readings were skipped")
-            if not readings:
-                raise SimulatorError(f"{machine_id}: no usable history readings")
-            histories[machine_id] = readings
-            print(f"loaded {len(readings)} readings for {machine_id}")
-        baseline = build_baseline(histories, nominals, args.reference_days, source=base_url)
+        baseline = build_from_server(base_url, args.reference_days, progress=print)
     except (SimulatorError, KeyError, TypeError, ValueError) as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}")
         return 1
