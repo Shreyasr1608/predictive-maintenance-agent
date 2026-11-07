@@ -4,18 +4,21 @@ A Python agent that watches the live sensor streams of four simulated machines a
 - learns what "normal" looks like for each machine from its 7-day history;
 - checks that same history for slow, multi-day degradation: a machine whose typical level has moved away from normal;
 - watches all four live streams at once, looking for three kinds of warning sign: sudden spikes, slow drifts, and several sensors misbehaving together;
-- names a likely cause in every alert, with the measured numbers behind it and a suggested check.
+- names a likely cause in every alert, with the measured numbers behind it and a suggested check;
+- books one maintenance slot for each machine it alerts on (the assignment's bonus).
 
 The approach is statistical and rule-based on purpose. Every alert can be traced back to measured numbers and to a documented threshold. There is no trained model and no LLM.
 
-**On the simulator** (230-second dry run against the real simulator, 2026-11-07):
+**On the simulator** (the latest 230-second dry run against the real simulator, 2026-11-07; a dry run only logs, so nothing was posted or booked):
 
 | Machine | Simulated fault | What the agent raises |
 |---|---|---|
 | CNC_01 | bearing wear | a **history** alert at startup: vibration 1.80 → 5.30 mm/s over days 4–7, with temperature and current also up; likely cause bearing wear |
 | CNC_02 | thermal runaway | a **live** alert after 173 s: temperature and motor current high together; likely cause overheating under load |
-| PUMP_03 | cavitation and a developing clog | a **history** alert at startup for the clog (speed 2950 → 2770 rpm, about −26 rpm per day), and a **live** alert after 178 s for the cavitation |
+| PUMP_03 | cavitation and a developing clog | a **history** alert at startup for the clog (speed 2950 → 2771 rpm, about −26 rpm per day), and a **live** alert after 173 s for the cavitation |
 | CONVEYOR_04 | none (healthy baseline) | nothing: no history shift, and risk level `none` on all 46 live evaluations |
+
+In the same run, a maintenance booking was logged once each for CNC_01, PUMP_03 and CNC_02, and none for CONVEYOR_04.
 
 CNC_01's wear and PUMP_03's clog are visible only in the history, because the simulator's live stream restarts every machine near its nominal values. [Known limitations](#known-limitations) explains what that means.
 
@@ -32,7 +35,7 @@ The assignment (Jnanik AI intern evaluation, "Predictive Maintenance Agent") ask
 | 3. Raise an alert: call `POST /alert` with a reason | `agent.py`: `post_alert`, called by `handle_result` (live) and `send_history_alert` (history) | Done |
 | 4. Explain the decision: a short, human-readable explanation of what triggered the alert | `agent.py`: `simple_reason` (live) and `history_reason` (history): likely cause, measured evidence, suggested check | Done |
 | API table: use `GET /history` "to learn what normal looks like" | `baseline.py` (`build_from_server`), rebuilt every time the agent starts | Done |
-| Bonus: call `POST /schedule-maintenance` after an alert | | **Not implemented** |
+| Bonus: call `POST /schedule-maintenance` after an alert | `agent.py`: `schedule_maintenance` and `post_maintenance`, called after a confirmed live or history alert; see [Maintenance booking](#maintenance-booking-the-bonus) | Done |
 | Submit: GitHub repository with a README that explains how to run it | this file | Done |
 | Submit: one architecture diagram | [Architecture](#architecture) | Done |
 | Submit: live walkthrough (no recording) | | At the presentation |
@@ -64,8 +67,8 @@ Created when the agent runs, and ignored by git: `agent.log` and `agent_baseline
 
 ## Requirements
 
-- **Python 3.** Developed and tested with Python 3.14.0 on Windows 11. The code only uses long-standing standard-library features, so Python 3.8 or newer should work, but no other version has been tested.
-- **Node.js 16 or newer**, for the simulator.
+- **Python 3.** Developed and tested with Python 3.14.0 on Windows 11. The agent only uses long-standing standard-library features, so Python 3.8 or newer should work for it; the tests need Python 3.10 or newer (they use `assertNoLogs`). No other version has been tested.
+- **Node.js 18 or newer**, for the simulator. Its README says 16, but the Express 5.2.1 it installs requires 18.
 - **Python packages** (`requirements.txt`):
   - `requests`: HTTP and the live streams; used by every script.
   - `matplotlib`: only `explore.py` needs it, for the plots.
@@ -113,7 +116,7 @@ pip install -r requirements.txt
 
 ## Running the agent
 
-Start with a dry run. It does everything except send alerts:
+Start with a dry run. It does everything except send alerts and maintenance bookings:
 
 ```
 python agent.py --dry-run --duration 400
@@ -134,7 +137,7 @@ Stop with **Ctrl+C**. The agent closes its four streams, which takes a second or
 | Option | Default | Meaning |
 |---|---|---|
 | `--base-url URL` | `http://localhost:3000` | Simulator address |
-| `--dry-run` | off | Decide and log, but never POST an alert |
+| `--dry-run` | off | Decide and log, but never POST an alert or a maintenance booking |
 | `--duration SECONDS` | run until Ctrl+C | Stop by itself after this many seconds |
 | `--log-file FILE` | `agent.log` | Full log, including every evidence item as JSON; appended to, not replaced |
 | `--save-baseline FILE` | `agent_baseline.json` | Where the baseline rebuilt at startup is saved |
@@ -155,29 +158,36 @@ A saved baseline describes the history of the simulator run it was built from. T
 
 ### What the console shows
 
-The excerpt below is real output from a 230-second dry run against the real simulator on 2026-11-07 (timestamps removed, `...` marks skipped lines):
+The excerpt below is real console output from the latest **dry run**: 230 seconds against a freshly started real simulator on 2026-11-07, after maintenance booking was added (timestamps removed, `...` marks skipped lines). Being a dry run, it **sent nothing**: every `would alert` and `would schedule maintenance` line was only logged, and afterwards the simulator had stored no alert and received no maintenance request.
 
 ```
 INFO    loaded 10081 readings for CNC_01
 ...
-WARNING machine=CNC_01 history check: SHIFT found: temperature_C +7.5 spreads (day 7 median 83.98 vs normal 72.06); vibration_mm_s +78.7 spreads (day 7 median 5.3 vs normal 1.8); current_A +8.8 spreads (day 7 median 14.99 vs normal 12.51)
-INFO    machine=CNC_02 history check: no sustained shift (largest: current_A +0.5 spreads; alert at 3.0)
-WARNING machine=PUMP_03 history check: SHIFT found: rpm +5.4 spreads (day 7 median 2770.5 vs normal 2950)
+WARNING machine=CNC_01 history check: SHIFT found: temperature_C +7.6 spreads (day 7 median 84.025 vs normal 71.96); vibration_mm_s +59.0 spreads (day 7 median 5.3 vs normal 1.8); current_A +8.9 spreads (day 7 median 15 vs normal 12.5)
+INFO    machine=CNC_02 history check: no sustained shift (largest: temperature_C +0.4 spreads; alert at 3.0)
+WARNING machine=PUMP_03 history check: SHIFT found: rpm +5.5 spreads (day 7 median 2771 vs normal 2950)
 INFO    machine=CONVEYOR_04 history check: no sustained shift (largest: vibration_mm_s +0.0 spreads; alert at 3.0)
-WARNING machine=CNC_01 DRY RUN, would alert (history): CNC_01: warning from the 7-day history. Likely cause: bearing wear. Evidence (daily medians): vibration 5.30 mm/s vs normal 1.80 (+194%), day 4 to 7: 1.80 -> 2.97 -> 4.13 -> 5.30 (about +1.17 mm/s per day), above normal since day 5; motor current 15.0 A vs normal 12.5 (+20%); temperature 84.0 C vs normal 72.1 (+17%). Suggested check: bearing condition and lubrication.
-WARNING machine=PUMP_03 DRY RUN, would alert (history): PUMP_03: warning from the 7-day history. Likely cause: a growing restriction or load slowing the machine, such as a developing clog. Evidence (daily medians): speed 2770 rpm vs nominal 2950 (-6%), day 1 to 7: 2923 -> 2899 -> 2873 -> 2848 -> 2821 -> 2796 -> 2770 (about -26 rpm per day), below normal since day 4. Suggested check: blockage at the inlet, filter or impeller, or a dragging drive.
+WARNING machine=CNC_01 DRY RUN, would alert (history): CNC_01: warning from the 7-day history. Likely cause: bearing wear. Evidence (daily medians): vibration 5.30 mm/s vs normal 1.80 (+194%), day 4 to 7: 1.80 -> 2.97 -> 4.13 -> 5.30 (about +1.17 mm/s per day), above normal since day 5; motor current 15.0 A vs normal 12.5 (+20%); temperature 84.0 C vs normal 72.0 (+17%). Suggested check: bearing condition and lubrication.
+WARNING machine=CNC_01 DRY RUN, would schedule maintenance (POST /schedule-maintenance) because: CNC_01: warning from the 7-day history. Likely cause: bearing wear. Evidence (daily medians): vibration 5.30 mm/s vs normal 1.80 (+194%), day 4 to 7: 1.80 -> 2.97 -> 4.13 -> 5.30 (about +1.17 mm/s per day), above normal since day 5; motor current 15.0 A vs normal 12.5 (+20%); temperature 84.0 C vs normal 72.0 (+17%). Suggested check: bearing condition and lubrication.
+WARNING machine=PUMP_03 DRY RUN, would alert (history): PUMP_03: warning from the 7-day history. Likely cause: a growing restriction or load slowing the machine, such as a developing clog. Evidence (daily medians): speed 2771 rpm vs nominal 2950 (-6%), day 1 to 7: 2926 -> 2898 -> 2874 -> 2846 -> 2820 -> 2796 -> 2771 (about -26 rpm per day), below normal since day 4. Suggested check: blockage at the inlet, filter or impeller, or a dragging drive.
+WARNING machine=PUMP_03 DRY RUN, would schedule maintenance (POST /schedule-maintenance) because: PUMP_03: warning from the 7-day history. Likely cause: a growing restriction or load slowing the machine, such as a developing clog. Evidence (daily medians): speed 2771 rpm vs nominal 2950 (-6%), day 1 to 7: 2926 -> 2898 -> 2874 -> 2846 -> 2820 -> 2796 -> 2771 (about -26 rpm per day), below normal since day 4. Suggested check: blockage at the inlet, filter or impeller, or a dragging drive.
 INFO    monitoring 4 machines: CNC_01, CNC_02, PUMP_03, CONVEYOR_04
 ...
+INFO    machine=CNC_02 level=high risk=5.5 decision=alert (high for 61 s) evidence=[spike:temperature_C=1.1 spike:current_A=1.1 pattern:co_elevation=4.3]
+WARNING machine=CNC_02 DRY RUN, would alert: CNC_02: abnormal behaviour in the live stream. Likely cause: overheating under load (thermal runaway). Evidence: temperature and motor current high at the same moment in 87% of the last 119 s; motor current above its normal range in 57% of the last 60 s (latest 13.4 A, normal 11.8); temperature above its normal range in 53% of the last 60 s (latest 70.6 C, normal 67.8). Suggested check: cooling (coolant flow, fans) and machine load.
+WARNING machine=CNC_02 DRY RUN, would schedule maintenance (POST /schedule-maintenance) because: CNC_02: abnormal behaviour in the live stream. Likely cause: overheating under load (thermal runaway). Evidence: temperature and motor current high at the same moment in 87% of the last 119 s; motor current above its normal range in 57% of the last 60 s (latest 13.4 A, normal 11.8); temperature above its normal range in 53% of the last 60 s (latest 70.6 C, normal 67.8). Suggested check: cooling (coolant flow, fans) and machine load.
+INFO    machine=PUMP_03 level=high risk=7.0 decision=alert (high for 61 s) evidence=[spike:vibration_mm_s=2.0 spike:current_A=2.0 pattern:vibration_variability=2.2 pattern:co_elevation=5.0]
 INFO    machine=CONVEYOR_04 level=none risk=0.0 decision=none (level none) evidence=[-]
-INFO    machine=CNC_02 level=high risk=7.0 decision=waiting (high for 55 s of 60 s required) evidence=[spike:temperature_C=2.0 spike:current_A=1.1 pattern:co_elevation=5.0]
-WARNING machine=CNC_02 DRY RUN, would alert: CNC_02: abnormal behaviour in the live stream. Likely cause: overheating under load (thermal runaway). Evidence: temperature and motor current high at the same moment in 100% of the last 119 s; temperature above its normal range in 100% of the last 60 s (latest 74.1 C, normal 67.9). Suggested check: cooling (coolant flow, fans) and machine load.
+WARNING machine=PUMP_03 DRY RUN, would alert: PUMP_03: abnormal behaviour in the live stream. Likely cause: cavitation or intermittent mechanical shocks. Evidence: vibration and motor current high at the same moment in 100% of the last 119 s; vibration 11.2x more erratic than normal (std 1.69 mm/s over the last 119 s); vibration above its normal range in 100% of the last 60 s (latest 7.20 mm/s, normal 2.21); motor current above its normal range in 100% of the last 60 s (latest 21.5 A, normal 18.1). Suggested check: inlet side (blockage, trapped air) and mountings.
 ...
 INFO    Summary (DRY RUN: 'alerts' are alerts that would have been sent):
-INFO      CNC_01       readings=227 evaluations=46 alerts=0 history_alerts=1 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
-INFO      CNC_02       readings=227 evaluations=46 alerts=1 history_alerts=0 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
-INFO      PUMP_03      readings=227 evaluations=46 alerts=1 history_alerts=1 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
-INFO      CONVEYOR_04  readings=227 evaluations=46 alerts=0 history_alerts=0 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
+INFO      CNC_01       readings=227 evaluations=46 alerts=0 history_alerts=1 maintenance=1 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
+INFO      CNC_02       readings=227 evaluations=46 alerts=1 history_alerts=0 maintenance=1 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
+INFO      PUMP_03      readings=227 evaluations=46 alerts=1 history_alerts=1 maintenance=1 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
+INFO      CONVEYOR_04  readings=227 evaluations=46 alerts=0 history_alerts=0 maintenance=0 malformed=0 out_of_order=0 gaps=0 reconnects=0 stream_errors=0 unexpected_errors=0
 ```
+
+PUMP_03 has only one maintenance line: its live alert came after the booking for its history alert, and a machine is booked at most once per run. CNC_01 and CONVEYOR_04 stayed at level `none` on all 46 live evaluations; the CONVEYOR_04 line above is one of them.
 
 At startup, each machine gets one **history check** line:
 - `SHIFT found`: each shifted sensor, its shift in spreads, and the newest day's median against normal;
@@ -217,6 +227,7 @@ flowchart LR
         HIST["GET /history/{id}<br/>7 days, 1 reading per minute"]
         STREAM["GET /stream/{id}<br/>SSE, 1 reading per second"]
         ALERT["POST /alert"]
+        MAINT["POST /schedule-maintenance"]
     end
 
     subgraph AGENT["agent.py (Python)"]
@@ -230,6 +241,7 @@ flowchart LR
             COMB["combine()<br/>none / watch / high"]
             DEC["_decide()<br/>60 s persistence,<br/>10 min cooldown"]
             EXPL["simple_reason()<br/>likely cause + evidence"]
+            SCHED["schedule_maintenance()<br/>after a confirmed alert,<br/>once per run"]
         end
         LOGS["logging<br/>console, agent.log, summary"]
     end
@@ -240,13 +252,14 @@ flowchart LR
     BASE -->|daily medians| HCHK -->|"shift found"| HSEND --> ALERT
     STREAM --> READ --> MON --> DET --> COMB --> DEC
     DEC -->|"alert decision"| EXPL --> ALERT
+    ALERT -->|"201: alert stored"| SCHED --> MAINT
     DEC -.-> LOGS
 ```
 
 **Two programs, one HTTP connection per job.** The simulator is a separate Node.js server, and the agent talks to it only over HTTP.
 - **At startup:** the agent downloads `/machines` and the 7-day `/history` of each machine, builds the baseline in memory and runs the history check. A machine whose history has shifted gets one alert straight away, before its stream opens.
 - **While running:** it opens one Server-Sent Events stream per machine. That is a never-ending HTTP response in which the server writes a `data: {json}` line every second.
-- **On an alert:** it sends `POST /alert`.
+- **On an alert:** it sends `POST /alert`. After the first alert the server has stored for a machine, it also sends `POST /schedule-maintenance` for that machine, once per run.
 
 **One thread per machine, nothing shared.**
 - Each thread owns its `MachineMonitor`, so there is no shared data to lock.
@@ -309,7 +322,7 @@ A standard significance test on the trend slope is deliberately not used. Live r
 3. **Confirmation.** `high` must hold for **60 s**, about 12 evaluations in a row, before an alert is sent:
    - One isolated evaluation below `high` is tolerated; two in a row restart the clock.
    - A gap of more than 15 s in the data also restarts it: evidence must be re-established after an outage.
-4. **Alert.** The explanation is built and `POST /alert` is sent. After a successful POST the machine gets a **10-minute cooldown**. If the POST fails, no cooldown starts and the agent tries again at the next evaluation, about 5 s later.
+4. **Alert.** The explanation is built and `POST /alert` is sent. After a successful POST the machine gets a **10-minute cooldown**, and, if it has not been booked yet in this run, a maintenance booking ([Maintenance booking](#maintenance-booking-the-bonus)). If the POST fails, no cooldown starts and the agent tries again at the next evaluation, about 5 s later.
 
 **Why the healthy conveyor stays quiet.** Its random bursts trigger the vibration spike for up to 56 s in a row, and sometimes the variability pattern. Both are about vibration only, so the level stays at `watch`. The 60 s confirmation is also just longer than the longest burst.
 
@@ -336,7 +349,7 @@ The recordings test the live path only. CNC_01's wear and PUMP_03's clog are ale
 3. Count only the harmful direction, as for drift: temperature, vibration and current up; rpm down.
 4. A shift of **3.0 spreads or more**, on a day after the reference window, is evidence.
 
-A machine with at least one shifted sensor gets **one** alert per run, which names every shifted sensor and is sent before its stream opens. A failed POST is retried at the next evaluation, about 5 s later. The history alert neither waits for nor starts the live 10-minute cooldown, because it is about days and the live rules are about minutes. Old baseline files without daily medians skip the check, and the log says so.
+A machine with at least one shifted sensor gets **one** alert per run, which names every shifted sensor and is sent before its stream opens. A failed POST is retried at the next evaluation: the first comes with the first live reading, then about every 5 s. The history alert neither waits for nor starts the live 10-minute cooldown, because it is about days and the live rules are about minutes. Old baseline files without daily medians skip the check, and the log says so.
 
 **Why medians and not the existing daily means.** A daily median moves only if more than half of the day (12 hours or more) is shifted, so bursts and one-off events cannot move it. A daily mean can. Measured on 12 histories made by the simulator's own `generate-history.js` (shift of the newest day, in spreads):
 
@@ -369,11 +382,11 @@ There are two kinds of alert. Both are sent with `POST /alert`; the simulator an
 | How often | again after each 10-minute cooldown while the fault lasts | once per agent run |
 | Text starts with | `CNC_02: abnormal behaviour in the live stream.` | `CNC_01: warning from the 7-day history.` |
 
-**The reason** always has the same parts: the kind of alert, the **likely cause**, the **measured evidence** (strongest first) and a **suggested check**. It never claims a failure is certain. Real texts from the dry run on 2026-11-07 (the history texts are in the console excerpt above):
+**The reason** always has the same parts: the kind of alert, the **likely cause**, the **measured evidence** (strongest first) and a **suggested check**. It never claims a failure is certain. Real texts from the same dry run as the console excerpt above (which also has the history texts):
 
-> CNC_02: abnormal behaviour in the live stream. Likely cause: overheating under load (thermal runaway). Evidence: temperature and motor current high at the same moment in 100% of the last 119 s; temperature above its normal range in 100% of the last 60 s (latest 74.1 C, normal 67.9). Suggested check: cooling (coolant flow, fans) and machine load.
+> CNC_02: abnormal behaviour in the live stream. Likely cause: overheating under load (thermal runaway). Evidence: temperature and motor current high at the same moment in 87% of the last 119 s; motor current above its normal range in 57% of the last 60 s (latest 13.4 A, normal 11.8); temperature above its normal range in 53% of the last 60 s (latest 70.6 C, normal 67.8). Suggested check: cooling (coolant flow, fans) and machine load.
 
-> PUMP_03: abnormal behaviour in the live stream. Likely cause: cavitation or intermittent mechanical shocks. Evidence: vibration and motor current high at the same moment in 74% of the last 119 s; vibration 17.9x more erratic than normal (std 2.69 mm/s over the last 119 s); vibration above its normal range in 100% of the last 60 s (latest 11.08 mm/s, normal 2.21). Suggested check: inlet side (blockage, trapped air) and mountings.
+> PUMP_03: abnormal behaviour in the live stream. Likely cause: cavitation or intermittent mechanical shocks. Evidence: vibration and motor current high at the same moment in 100% of the last 119 s; vibration 11.2x more erratic than normal (std 1.69 mm/s over the last 119 s); vibration above its normal range in 100% of the last 60 s (latest 7.20 mm/s, normal 2.21); motor current above its normal range in 100% of the last 60 s (latest 21.5 A, normal 18.1). Suggested check: inlet side (blockage, trapped air) and mountings.
 
 **How the likely cause is chosen** (`agent.py`: `LIKELY_CAUSES`, `live_causes`, `history_causes`). It comes from the evidence, never from the machine's name. The starting point is the assignment's own sensor table: rising temperature means thermal stress or cooling failure, increasing vibration means bearing wear, rpm drift means a load or mechanical issue, high current means motor overload. Common combinations of those signs are added:
 
@@ -391,7 +404,40 @@ An alert names at most two causes. They are hints for the person who inspects th
 - **Dry run** (`--dry-run`): the same decisions, logged as `DRY RUN, would alert: ...` (live) and `DRY RUN, would alert (history): ...`. Nothing is posted. The live cooldown still applies, so the log shows the real rhythm of alerts.
 - **When posting fails** (no answer, timeout, any status other than 201), the error is logged and the alert, live or history, is retried at the next evaluation. A `201` with an unexpected body still counts as sent, because 201 means the server stored it, and sending it again would create a duplicate.
 - **Repeat alerts:** while a fault continues, a machine gets another live alert when its 10-minute cooldown ends. If the fault went away, a new episode needs its own 60 s of confirmation. The history alert is sent once per run, so restarting the agent sends it again.
-- **Maintenance booking** (`POST /schedule-maintenance`, an optional bonus) is **not implemented**. Bookings on the simulator can be neither listed nor deleted, and the required alerting was the priority.
+
+### Maintenance booking (the bonus)
+
+After a machine's first **confirmed** alert, live or history, the agent books maintenance for it (`agent.py`: `schedule_maintenance`, `post_maintenance`). "Confirmed" means the simulator answered the alert's `POST /alert` with `201`, or, in a dry run, that the alert was logged.
+
+**The contract, read from the simulator's `server.js`:**
+
+| | |
+|---|---|
+| Request | `POST /schedule-maintenance` with a JSON body |
+| `machine_id` | required string, one of the four machine IDs |
+| `proposed_slot` | optional; stored exactly as given, without any check. Without it, the server books the next business morning at 06:00 (server local time) |
+| Success | `201 {"success": true, "booking": {"id": "MAINT-...", "machine_id", "slot", "booked_at", "technician": "Auto-assigned"}}` |
+| Errors | `400 {"error": "Body must include machine_id."}`, or `400 {"error": "Unknown machine: ..."}` |
+
+The agent sends exactly `{"machine_id": ...}` and lets the server choose the slot. The endpoint has no field for a reason, so the **reason is kept with the alert instead**: the alert stored on the simulator carries the full explanation, and the agent's log line links the booking to that alert. The line below is an illustrative format example (values elided), not actual output or a real booking:
+
+```
+machine=CNC_02 MAINTENANCE BOOKED id=MAINT-... slot=... technician=Auto-assigned for alert ALERT-... because: CNC_02: abnormal behaviour in the live stream. Likely cause: ...
+```
+
+**No duplicates.** The simulator books every request it receives, so the agent itself makes sure each machine is booked at most once per run:
+
+| Outcome of the request | What the agent does next |
+|---|---|
+| `201` (also with an unexpected body: 201 means it is booked) | never books this machine again in this run |
+| another HTTP status (`400`, `500`, ...): the server answered and booked nothing | tries again, but only at the machine's next confirmed alert (at the earliest after the 10-minute cooldown), never in a loop |
+| no answer (timeout, broken or refused connection): it may or may not have been booked | never repeats it in this run, and logs that the booking should be checked |
+
+So PUMP_03, which gets a history alert and later a live alert, is booked once. A healthy machine, which never gets an alert, is never booked.
+
+**Failures change nothing else.** Every error is caught and logged inside `schedule_maintenance`. The alert, its cooldown, the history check and the stream are never affected, and the booking never makes a machine's thread reconnect.
+
+**Dry run:** it only logs `DRY RUN, would schedule maintenance ...`, once per machine. Nothing is sent.
 
 ---
 
@@ -412,7 +458,7 @@ Every setting is a named constant at the top of the file that uses it, with a co
 | `MAX_GAP_S` | 15 s | A longer silence in the data restarts the confirmation |
 | `RECONNECT_DELAYS_S` | 1, 2, 4, 8, 15, 30 s | Waits between reconnection attempts; the last one repeats |
 | `STREAM_CONNECT_TIMEOUT_S`, `STREAM_READ_TIMEOUT_S` | 5 s, 10 s | A stream silent for 10 s is treated as dead (readings come every second) |
-| `POST_TIMEOUT_S` | 10 s | Time limit for `POST /alert` |
+| `POST_TIMEOUT_S` | 10 s | Time limit for `POST /alert` and `POST /schedule-maintenance` |
 | `SHUTDOWN_WAIT_S` | 15 s | How long the agent waits for its threads when stopping |
 | `LIKELY_CAUSES`, `MAX_CAUSES` | 11 causes, at most 2 per alert | The likely cause and the suggested check for each evidence pattern |
 
@@ -456,7 +502,7 @@ Every setting is a named constant at the top of the file that uses it, with a co
 python -m unittest discover -v
 ```
 
-Run it from the project folder. It runs 128 tests in about 40 seconds and needs **no simulator** and no Node.js. The three end-to-end tests start a small fake simulator on 127.0.0.1 that replays the recordings about 40 times faster than real time. Every test of alert sending uses fakes or that local fake server, so no test ever posts to the real simulator. The history tests build 7-day histories with `tests/sim_history.py`, a Python copy of the simulator's `generate-history.js`; its daily medians were compared with 12 runs of the real generator.
+Run it from the project folder. It runs 148 tests in about 60 seconds and needs **no simulator** and no Node.js. The five end-to-end tests start a small fake simulator on 127.0.0.1 that replays the recordings about 40 times faster than real time and also answers `POST /schedule-maintenance`. Every test of alert or maintenance sending uses fakes or that local fake server, so no test ever posts to the real simulator. The history tests build 7-day histories with `tests/sim_history.py`, a Python copy of the simulator's `generate-history.js`; its daily medians were compared with 12 runs of the real generator.
 
 | File | What it checks |
 |---|---|
@@ -468,11 +514,13 @@ Run it from the project folder. It runs 128 tests in about 40 seconds and needs 
 | `tests/test_history.py` | Daily medians in the baseline (bursts move the mean, not the median); the history rule on known data: threshold, harmful direction only, a shift that went away, nominal value for drifting sensors, history spread, old and damaged baselines; all four machines on simulated histories (3 seeds: CNC_01 and PUMP_03 flagged on the right sensors, CNC_02 and CONVEYOR_04 below 1 spread); the day-5 early-warning replay; conveyor excursions of 72 minutes, 10 hours and 14 hours on its newest day |
 | `tests/test_agent_history.py` | The history alert is sent once, before streaming, retried after a failed POST, only logged in a dry run, and never starts the live cooldown; a damaged history part never stops live monitoring; the startup log line and the summary counter |
 | `tests/test_explanations.py` | Which likely cause is named for which evidence, live and history; the history texts for CNC_01 and PUMP_03; no text can break the dashboard's HTML |
-| `tests/test_end_to_end.py` | The real `run_agent()` with four threads against the fake simulator: one alert each for CNC_02 and PUMP_03 even though every stream breaks once; dry run sends nothing; with daily medians in the baseline, history alerts for CNC_01 and PUMP_03 come first, the live alerts are unchanged, and CONVEYOR_04 gets nothing |
+| `tests/test_maintenance.py` | The `/schedule-maintenance` request follows the contract (only `machine_id`); success, HTTP errors, timeouts and refused connections; one booking per machine per run; a rejection is retried only at the next confirmed alert, a request without an answer never; booked only after a confirmed live or history alert, never after a failed alert POST or for a healthy machine; dry run sends nothing; a failed booking leaves the alert and its cooldown as they were |
+| `tests/test_end_to_end.py` | The real `run_agent()` with four threads against the fake simulator: one alert each for CNC_02 and PUMP_03 even though every stream breaks once; dry run sends nothing; with daily medians in the baseline, history alerts for CNC_01 and PUMP_03 come first, the live alerts are unchanged, and CONVEYOR_04 gets nothing; one maintenance booking each for CNC_01, CNC_02 and PUMP_03, each after that machine's first alert, none for CONVEYOR_04; failing bookings (HTTP 500) leave the alerts and their timing unchanged |
 
 `python try_detector.py` replays the recordings in `data/` through the detectors and prints how often each one fires.
 
 **Manual checks on the real simulator:**
+- 2026-11-07, after maintenance booking was added: a 230-second dry run on a freshly started simulator, shown in [What the console shows](#what-the-console-shows). History alerts for CNC_01 and PUMP_03 at startup; live alerts for CNC_02 and PUMP_03 after 173 s; maintenance logged as DRY RUN once each for CNC_01, PUMP_03 and CNC_02; CNC_01 and CONVEYOR_04 at level `none` on all 46 evaluations each. Afterwards `GET /alerts` was empty and the simulator's console showed no `/alert` or `/schedule-maintenance` request.
 - 2026-11-07, after the history check was added: a 230-second dry run. History alerts for CNC_01 and PUMP_03 0.7 s after start; live alerts for CNC_02 after 173 s and PUMP_03 after 178 s; CNC_01 and CONVEYOR_04 at level `none` on all 46 evaluations each; `GET /alerts` was still empty afterwards, so nothing was posted.
 - An earlier 400-second dry run detected CNC_02 and PUMP_03.
 - A Ctrl+C test stopped all four monitoring threads cleanly.
@@ -503,7 +551,11 @@ Run it from the project folder. It runs 128 tests in about 40 seconds and needs 
 - **The `status` field is ignored on purpose.** It is the simulator's own label; detection uses the sensor values only. The tests use it only to show timing (the day-5 replay).
 - **No log rotation.** `agent.log` keeps growing, by roughly 2 to 3 MB per hour of running (measured: 312 KB for about 8 minutes of data with two machines alerting).
 - **Only one environment tested.** Python 3.14.0 on Windows 11.
-- **No maintenance booking.** The optional `/schedule-maintenance` call is not implemented.
+- **Maintenance booking is simple.**
+  - The endpoint has no reason field, so the reason lives in the stored alert and the agent's log, not in the booking.
+  - The slot is always the server's default (the next business morning, 06:00), however urgent the alert.
+  - Bookings can be neither listed nor cancelled on the simulator. A restarted agent books again, and a request that got no answer is not repeated, so after a timeout the booking may be missing; the log says so.
+  - Real bookings were tested against the fake simulator only. Against the real simulator the agent has run in dry runs only, which send nothing, so no real booking has ever been made.
 
 ## Possible improvements
 
@@ -512,7 +564,7 @@ Run it from the project folder. It runs 128 tests in about 40 seconds and needs 
 - Read `GET /alerts` at startup, so that a restarted agent does not repeat its history alerts.
 - Longer trend windows, for example hours, for slow wear, alongside the 5-minute one.
 - Severity escalation during a cooldown when the risk keeps rising.
-- Maintenance booking after an alert, with protection against double bookings.
+- Choose the maintenance slot by urgency with `proposed_slot`, for example sooner for a live thermal runaway than for slow bearing wear.
 - Calibrating live noise from a commissioning period instead of fixed constants.
 - An optional Isolation Forest as an extra, low-weight evidence kind. It would never decide alone.
 - A configuration file and log rotation for long-running use.

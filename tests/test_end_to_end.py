@@ -43,6 +43,7 @@ class EndToEndTest(unittest.TestCase):
         with FakeSimulator() as sim:
             _, text = self.run_agent(sim, dry_run=True)
         self.assertEqual(sim.posts, [])
+        self.assertEqual(sim.maintenance_posts, [])
         for machine in ("CNC_02", "PUMP_03"):
             self.assertEqual(text.count(f"machine={machine} DRY RUN, would alert"), 1)
         for machine in ("CNC_01", "CONVEYOR_04"):
@@ -75,6 +76,38 @@ class EndToEndTest(unittest.TestCase):
                          {"CNC_01": 1, "CNC_02": 0, "PUMP_03": 1, "CONVEYOR_04": 0})
         self.assertEqual(text.count("ALERT SENT (history)"), 2)
         self.assertIn("machine=CONVEYOR_04 history check: no sustained shift", text)
+
+    def test_maintenance_is_booked_once_per_alerting_machine_after_its_first_alert(self):
+        with FakeSimulator() as sim:
+            monitors, text = self.run_agent(sim, dry_run=False, baseline=sim_history.fixture_baseline_with_history())
+        self.assertEqual(sorted(b["machine_id"] for b in sim.bookings), ["CNC_01", "CNC_02", "PUMP_03"])
+        self.assertEqual(sorted(sim.maintenance_posts, key=lambda body: body["machine_id"]),
+                         [{"machine_id": m} for m in ("CNC_01", "CNC_02", "PUMP_03")])   # the contract, nothing more
+        for machine in ("CNC_01", "CNC_02", "PUMP_03"):
+            with self.subTest(machine):
+                mine = [kind for kind, m in sim.events if m == machine]
+                self.assertEqual(mine[0], "alert")              # never before the machine's first alert
+                self.assertEqual(mine.count("maintenance"), 1)
+                self.assertEqual(monitors[machine].maintenance["state"], "booked")
+        self.assertIsNone(monitors["CONVEYOR_04"].maintenance)   # the healthy machine
+        self.assertEqual(sim.stored_per_machine(), {"CNC_01": 1, "CNC_02": 1, "PUMP_03": 2, "CONVEYOR_04": 0})
+        self.assertEqual(text.count("MAINTENANCE BOOKED"), 3)
+
+    def test_failing_maintenance_bookings_change_nothing_else(self):
+        with FakeSimulator(maintenance_status=500) as sim:
+            monitors, text = self.run_agent(sim, dry_run=False)
+        self.assertEqual(sim.stored_per_machine(), {"CNC_01": 0, "CNC_02": 1, "PUMP_03": 1, "CONVEYOR_04": 0})
+        for alert in sim.alerts:   # the live alerts come at the same moment as without bookings
+            machine = alert["machine_id"]
+            seconds = (parse_timestamp(alert["reading"]["timestamp"]) - parse_timestamp(sim.first_timestamp[machine])).total_seconds()
+            self.assertEqual(round(seconds), {"CNC_02": 173, "PUMP_03": 172}[machine])
+        self.assertEqual(sorted(body["machine_id"] for body in sim.maintenance_posts), ["CNC_02", "PUMP_03"])
+        self.assertEqual(sim.bookings, [])
+        self.assertEqual(text.count("maintenance NOT booked (HTTP 500"), 2)
+        for machine, monitor in monitors.items():
+            with self.subTest(machine):
+                self.assertEqual((monitor.stats["unexpected_errors"], monitor.stats["stream_errors"]), (0, 0))
+                self.assertGreater(monitor.stats["readings"], 200)
 
 
 if __name__ == "__main__":

@@ -69,6 +69,7 @@ class HandleResultTest(unittest.TestCase):
 
     def handle(self, result, dry_run, post_answer):
         with mock.patch.object(agent, "post_alert", return_value=post_answer) as fake_post, \
+                mock.patch.object(agent, "post_maintenance", return_value=("booked", {})), \
                 self.assertLogs("agent", level="INFO") as logs:
             agent.handle_result(self.monitor, result, URL, dry_run, agent.simple_reason)
         return fake_post, "\n".join(logs.output)

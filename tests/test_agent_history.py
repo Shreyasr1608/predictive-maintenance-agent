@@ -62,6 +62,7 @@ class MonitorHistoryTest(unittest.TestCase):
 class SendHistoryAlertTest(unittest.TestCase):
     def send(self, monitor, post_answer, dry_run=False):
         with mock.patch.object(agent, "post_alert", return_value=post_answer) as fake_post, \
+                mock.patch.object(agent, "post_maintenance", return_value=("booked", {})), \
                 self.assertLogs("agent", level="INFO") as logs:
             agent.send_history_alert(monitor, URL, dry_run, agent.history_reason)
         return fake_post, "\n".join(logs.output)
@@ -115,6 +116,7 @@ class RunMachineHistoryTest(unittest.TestCase):
         stream = [json.dumps(reading(START + timedelta(seconds=i))) for i in range(12)]
         with mock.patch.object(agent, "read_stream_lines", scripted_stream([stream])), \
                 mock.patch.object(agent, "post_alert", side_effect=fake_post), \
+                mock.patch.object(agent, "post_maintenance", return_value=("booked", {})), \
                 self.assertLogs("agent", level="INFO") as logs:
             agent.run_machine(URL, monitor, RecordingEvent(), dry_run=False, explain=agent.simple_reason)
         self.assertEqual(readings_at_post, [0, 1])   # before the first reading, then at the first evaluation

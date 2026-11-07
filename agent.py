@@ -34,9 +34,15 @@ the live cooldown: it is about days, the live rules are about minutes.
 Every alert names a likely cause (chosen from the evidence, never from the machine's name), the
 measured evidence and a suggested check.
 
+Maintenance booking (the assignment's bonus): after a machine's first confirmed alert (live or
+history), the agent books one maintenance slot for it with POST /schedule-maintenance. At most
+one booking per machine per run; a rejected request is tried again only at that machine's next
+confirmed alert, and a request that got no answer is never repeated (it may have been booked).
+A failed booking is logged and changes nothing else.
+
 Usage:
   python agent.py                      # monitor until Ctrl+C
-  python agent.py --dry-run            # decide and log, but do NOT post alerts
+  python agent.py --dry-run            # decide and log, but do NOT post alerts or book maintenance
   python agent.py --duration 300       # stop by itself after 5 minutes
 Close the simulator's browser dashboard first: every extra stream connection to a machine
 speeds that machine up (see Phase 1).
@@ -178,6 +184,9 @@ class MachineMonitor:
             Evidence("history", s.sensor, (s.sensor,), s.score, s.evidence)
             for s in self.history_signals if s.triggered)
         self.history_alert_sent = False
+        # Maintenance booking: None (not tried yet) or a dict with "state" ("booked", "dry_run",
+        # "rejected" or "unknown") plus the alert it was for. See schedule_maintenance().
+        self.maintenance = None
 
     def _check_history(self):
         """Run the history check. Returns (signals, note). Never raises: a damaged history part
@@ -327,6 +336,19 @@ class MachineMonitor:
         Deliberately leaves the live cooldown alone."""
         self.history_alert_sent = True
         self.stats["history_alerts"] += 1
+
+    # -- maintenance booking (at most one per run) ---------------------------------
+    def maintenance_due(self):
+        """True until a booking succeeded (or was logged in a dry run) or a request went
+        unanswered. After a rejection (the server answered, booked nothing) it is due again, but
+        the caller only asks at the next confirmed alert."""
+        return self.maintenance is None or self.maintenance["state"] == "rejected"
+
+    def record_maintenance(self, state, **detail):
+        """Remember the outcome of a maintenance request ("booked", "dry_run", "rejected", "unknown")."""
+        self.maintenance = dict(detail, state=state)
+        if state in ("booked", "dry_run"):
+            self.stats["maintenance"] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +534,71 @@ def post_alert(base_url, machine_id, reason, reading):
 
 
 # ---------------------------------------------------------------------------
+# I/O: booking maintenance (the assignment's bonus)
+# ---------------------------------------------------------------------------
+def post_maintenance(base_url, machine_id):
+    """
+    POST /schedule-maintenance. Contract (read from server.js): body {machine_id, proposed_slot?};
+    answer HTTP 201 {success: true, booking: {id, machine_id, slot, booked_at, technician}}, or
+    HTTP 400 {error} if machine_id is missing or unknown. Without proposed_slot the server books
+    the next business morning at 06:00 (it accepts any proposed_slot unchecked, so none is sent).
+    The endpoint has no field for a reason. Returns (outcome, info):
+      ("booked", booking)   HTTP 201; booking is {} if the answer body was unexpected
+      ("rejected", text)    any other HTTP status: the server answered and booked nothing
+      ("unknown", text)     no answer (timeout, broken connection): it may or may not be booked
+    Never raises for network problems.
+    """
+    try:
+        response = requests.post(base_url + "/schedule-maintenance", json={"machine_id": machine_id},
+                                 timeout=POST_TIMEOUT_S)
+    except requests.exceptions.RequestException as exc:
+        return "unknown", f"{type(exc).__name__}: {exc}"
+    if response.status_code != 201:
+        return "rejected", f"HTTP {response.status_code}: {response.text[:200]}"
+    try:
+        answer = response.json()
+    except ValueError:
+        answer = None
+    booking = answer.get("booking") if isinstance(answer, dict) else None
+    return "booked", booking if isinstance(booking, dict) else {}
+
+
+def schedule_maintenance(monitor, base_url, dry_run, reason, alert_id):
+    """
+    Book maintenance for this machine. Call ONLY after one of its alerts was confirmed (POSTed
+    with HTTP 201, or logged in a dry run); `reason` is that alert's text, `alert_id` its id.
+    At most one booking per machine per run (the server itself books every request it gets):
+      booked / dry run : never again in this run
+      rejected         : tried again at the next confirmed alert, not before
+      unknown          : never again in this run (it may have been booked; the log says so)
+    A dry run only logs. Never raises: a failed booking must not disturb the monitoring.
+    """
+    machine_id = monitor.machine_id
+    if not monitor.maintenance_due():
+        return
+    if dry_run:
+        monitor.record_maintenance("dry_run", alert_id=alert_id, reason=reason)
+        log.warning("machine=%s DRY RUN, would schedule maintenance (POST /schedule-maintenance) because: %s",
+                    machine_id, reason)
+        return
+    try:
+        outcome, info = post_maintenance(base_url, machine_id)
+    except Exception as exc:   # a bug must not reach the stream loop (it would reconnect)
+        log.exception("machine=%s unexpected error while booking maintenance", machine_id)
+        outcome, info = "unknown", f"{type(exc).__name__}: {exc}"
+    monitor.record_maintenance(outcome, alert_id=alert_id, reason=reason, info=info)
+    if outcome == "booked":
+        log.warning("machine=%s MAINTENANCE BOOKED id=%s slot=%s technician=%s for alert %s because: %s",
+                    machine_id, info.get("id"), info.get("slot"), info.get("technician"), alert_id, reason)
+    elif outcome == "rejected":
+        log.error("machine=%s maintenance NOT booked (%s); will try again only after the next confirmed alert",
+                  machine_id, info)
+    else:
+        log.error("machine=%s maintenance request got no answer (%s); it may or may not be booked, so it is "
+                  "not repeated in this run: check the simulator's maintenance log", machine_id, info)
+
+
+# ---------------------------------------------------------------------------
 # I/O: streaming with reconnection
 # ---------------------------------------------------------------------------
 def read_stream_lines(base_url, machine_id, stop_event):
@@ -552,6 +639,7 @@ def handle_result(monitor, result, base_url, dry_run, explain):
     if dry_run:
         log.warning("machine=%s DRY RUN, would alert: %s", assessment.machine_id, reason)
         monitor.confirm_alert(assessment.time)
+        schedule_maintenance(monitor, base_url, True, reason, None)
         return
     stored = post_alert(base_url, assessment.machine_id, reason, assessment.latest_reading)
     if stored is None:
@@ -559,6 +647,7 @@ def handle_result(monitor, result, base_url, dry_run, explain):
         return
     monitor.confirm_alert(assessment.time)
     log.warning("machine=%s ALERT SENT id=%s reason=%s", assessment.machine_id, stored.get("id"), reason)
+    schedule_maintenance(monitor, base_url, False, reason, stored.get("id"))
 
 
 def send_history_alert(monitor, base_url, dry_run, explain_history):
@@ -573,6 +662,7 @@ def send_history_alert(monitor, base_url, dry_run, explain_history):
     if dry_run:
         log.warning("machine=%s DRY RUN, would alert (history): %s", monitor.machine_id, reason)
         monitor.confirm_history_alert()
+        schedule_maintenance(monitor, base_url, True, reason, None)
         return
     stored = post_alert(base_url, monitor.machine_id, reason, None)
     if stored is None:
@@ -580,6 +670,7 @@ def send_history_alert(monitor, base_url, dry_run, explain_history):
         return
     monitor.confirm_history_alert()
     log.warning("machine=%s ALERT SENT (history) id=%s reason=%s", monitor.machine_id, stored.get("id"), reason)
+    schedule_maintenance(monitor, base_url, False, reason, stored.get("id"))
 
 
 def run_machine(base_url, monitor, stop_event, dry_run, explain, explain_history=history_reason):
@@ -711,15 +802,17 @@ def print_summary(monitors, dry_run=False):
       readings, evaluations   accepted readings, and how often the detectors ran
       alerts                  live alerts sent; in a dry run, alerts that WOULD have been sent
       history_alerts          history alerts sent (at most 1 per run); in a dry run, would-be ones
+      maintenance             maintenance slots booked (at most 1 per run); in a dry run, would-be ones
       malformed, out_of_order rejected stream lines and readings (warnings in the log say why)
       gaps                    silences longer than MAX_GAP_S between two readings
       reconnects              times the stream was opened again (or tried) after it ended
       stream_errors           connection problems: refused, timed out, broken, bad HTTP status
       unexpected_errors       exceptions caught by the last-resort handler (tracebacks in the log)
     """
-    keys = ("readings", "evaluations", "alerts", "history_alerts", "malformed", "out_of_order", "gaps",
+    keys = ("readings", "evaluations", "alerts", "history_alerts", "maintenance", "malformed", "out_of_order", "gaps",
             "reconnects", "stream_errors", "unexpected_errors")
-    log.info("Summary%s:", " (DRY RUN: 'alerts' are alerts that would have been sent)" if dry_run else "")
+    log.info("Summary%s:", " (DRY RUN: 'alerts', 'history_alerts' and 'maintenance' count alerts and "
+             "maintenance bookings that would have been sent)" if dry_run else "")
     for machine_id, monitor in monitors.items():
         log.info("  %-12s %s", machine_id, " ".join(f"{key}={monitor.stats[key]}" for key in keys))
 
@@ -784,7 +877,7 @@ def parse_args(argv=None):
     parser.add_argument("--log-file", default="agent.log",
                         help="full log including the DEBUG evidence, appended (default: agent.log)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="decide and log, but never POST alerts")
+                        help="decide and log, but never POST alerts or maintenance bookings")
     parser.add_argument("--duration", type=float, metavar="SECONDS",
                         help="stop by itself after this many seconds (default: run until Ctrl+C)")
     parser.add_argument("--use-saved-baseline", metavar="FILE",
@@ -809,7 +902,8 @@ def main(argv=None):
 
     log.info("=" * 70)
     log.info("agent starting: %s; simulator %s; log file %s",
-             "DRY RUN (alerts are only logged)" if args.dry_run else "LIVE (alerts are POSTed)",
+             "DRY RUN (alerts and maintenance bookings are only logged)" if args.dry_run
+             else "LIVE (alerts and maintenance bookings are POSTed)",
              base_url, args.log_file)
     log.info("settings: evaluate every %s s, persistence %s s, cooldown %s s, duration %s",
              EVAL_INTERVAL_S, PERSISTENCE_S, COOLDOWN_S,

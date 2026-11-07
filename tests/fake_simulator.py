@@ -4,6 +4,9 @@ A small stand-in for the Node.js simulator, used only by the end-to-end tests. I
   GET  /stream/{id}   Server-Sent Events over chunked transfer: a ": connected" comment, then
                       one "data: {json}" event per reading
   POST /alert         201 {"success": true, "alert": {...}}; 400 if machine_id or reason is missing
+  POST /schedule-maintenance
+                      201 {"success": true, "booking": {...}}; 400 if machine_id is missing or
+                      unknown. With maintenance_status=N it answers HTTP N without booking.
   GET  /alerts        {"count", "alerts"}
 The streams replay the recorded captures in tests/fixtures (with their own timestamps) much
 faster than real time, looping with timestamps that carry on after the last reading.
@@ -22,9 +25,10 @@ from common import SENSOR_FIELDS, parse_timestamp
 
 
 class FakeSimulator:
-    def __init__(self, seconds_per_reading=0.025, drop_after=None):
+    def __init__(self, seconds_per_reading=0.025, drop_after=None, maintenance_status=201):
         self.seconds_per_reading = seconds_per_reading   # 0.025 s = 40x faster than the real 1 s
         self.drop_after = drop_after
+        self.maintenance_status = maintenance_status
         self.lock = threading.Lock()
         self.stopping = threading.Event()
         self.rows = {m: self._load(m) for m in MACHINES}
@@ -33,8 +37,11 @@ class FakeSimulator:
         self.open_streams = Counter()
         self.max_open = Counter()        # most streams open at the same time, per machine
         self.first_timestamp = {}
-        self.posts = []                  # every POST /alert body received
+        self.posts = []                  # every POST body received on any path except /schedule-maintenance
         self.alerts = []                 # alerts stored (answered with 201)
+        self.maintenance_posts = []      # every POST /schedule-maintenance body received
+        self.bookings = []               # bookings stored (answered with 201)
+        self.events = []                 # ("alert" or "maintenance", machine_id) in arrival order
         self.server = None
 
     @staticmethod
@@ -150,8 +157,11 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             body = None
         body = body if isinstance(body, dict) else {}
+        if self.path == "/schedule-maintenance":
+            return self._maintenance(body)
         with sim.lock:
             sim.posts.append(body)
+            sim.events.append(("alert", body.get("machine_id")))
         if self.path != "/alert" or not body.get("machine_id") or not body.get("reason"):
             return self._json(400, {"error": "Body must include machine_id and reason."})
         with sim.lock:
@@ -159,3 +169,19 @@ class _Handler(BaseHTTPRequestHandler):
                      "reason": body["reason"], "reading": body.get("reading")}
             sim.alerts.append(alert)
         return self._json(201, {"success": True, "alert": alert})
+
+    def _maintenance(self, body):
+        sim = self.server.sim
+        with sim.lock:
+            sim.maintenance_posts.append(body)
+            sim.events.append(("maintenance", body.get("machine_id")))
+        if sim.maintenance_status != 201:
+            return self._json(sim.maintenance_status, {"error": "test failure"})
+        if body.get("machine_id") not in MACHINES:
+            return self._json(400, {"error": "Body must include machine_id."})
+        with sim.lock:
+            booking = {"id": f"MAINT-TEST-{len(sim.bookings) + 1}", "machine_id": body["machine_id"],
+                       "slot": body.get("proposed_slot") or "2026-11-09T00:30:00.000Z",
+                       "booked_at": "2026-11-07T10:00:00.000Z", "technician": "Auto-assigned"}
+            sim.bookings.append(booking)
+        return self._json(201, {"success": True, "booking": booking})
