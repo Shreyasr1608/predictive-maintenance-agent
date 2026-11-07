@@ -20,7 +20,12 @@ What Phase 1 taught us, and how it shapes this file:
 
 How the baseline will be used (Phase 3): for a live reading of machine M, sensor S at hour
 H (UTC), look up the stored centre/spread/percentiles, then compare. Hour-of-day statistics
-are stored because the task asks for them; the report shows how much they actually matter.
+are stored too. The assignment does not ask for them; they were added because CNC_02's fault
+is described as an afternoon problem. The report shows how little they matter in this data.
+
+The daily medians of ALL history days are stored as well. The agent's history health check
+(detector.detect_history_shift) compares the newest day's median with normal, to find slow,
+multi-day degradation that the live stream cannot show.
 
 Usage:
   python baseline.py                       # fetch history, print report, write baseline.json
@@ -195,6 +200,10 @@ def build_sensor_baseline(field, readings, start, reference_days, nominal):
         "tail_hours": tail_hours,
         "first_departure_day": first_departure_day,
         "daily_means": [sig(statistics.mean(day_values[d])) for d in sorted(day_values)],
+        # For the history health check: medians, because bursts and one-off events move a
+        # daily mean (PUMP_03 vibration: +3 to +5 spreads every day) but not a daily median.
+        "daily_days": [d + 1 for d in sorted(day_values)],     # 1-based, aligned with the lists
+        "daily_medians": [sig(statistics.median(day_values[d])) for d in sorted(day_values)],
         "overall": describe(values),
         "hourly": hourly,
     }

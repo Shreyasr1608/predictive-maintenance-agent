@@ -1,11 +1,13 @@
 """
 detector.py -- Phase 3: turn readings into evidence.
 
-Three detectors, built and checked one at a time:
+Three live detectors, built and checked one at a time:
   3A  spike detection
   3B  drift detection
   3C  pattern detection
 (3D, an optional Isolation Forest, was deliberately not built; see README.md.)
+One history detector, run once at startup on the baseline's daily statistics:
+  3E  history shift (slow, multi-day degradation the live stream cannot show)
 
 Every detector returns Signal objects with the same shape, so the agent (Phase 4) can combine
 them. A detector only produces evidence. It never posts alerts and never decides on its own
@@ -23,6 +25,7 @@ Design notes (from Phase 1 and 1b):
 import math
 import statistics
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from common import SENSOR_FIELDS, check_reading, parse_timestamp
 
@@ -127,6 +130,28 @@ PATTERN_CO_ELEVATION_SHARE = 0.20
 # these are plain judgement values, checked only on synthetic data.
 PATTERN_RPM_LOW_Z = 3.0
 PATTERN_CURRENT_CHANGE_Z = 2.0
+
+# --- History shift settings (3E) ----------------------------------------------------------------
+# The live stream cannot show multi-day wear: the simulator's live generator starts every machine
+# near its nominal values and adds only a small wear term (CNC_01 levels off about +0.2 mm/s,
+# below the live noise; PUMP_03 about -1 rpm). The 7-day history does show it. So, once at
+# startup, each sensor's MEDIAN on the newest full day of history is compared with normal (the
+# reference_center baseline.py learned; the nominal value for a sensor already drifting in the
+# reference window, like PUMP_03 rpm), in units of the history spread (history compared with
+# history; the live-noise floor above is for live readings only).
+#
+# Why medians and not the existing daily means: a daily median only moves if more than half of
+# the day (12+ hours) is shifted, so bursts and one-off events cannot move it. Measured on 12
+# histories made by the simulator's own generate-history.js, shift of the newest day in spreads:
+#   daily MEANS  : PUMP_03 vibration +3.1..+4.9 (cavitation bursts), CNC_02 temperature and
+#                  current +3.2..+3.8 (afternoon spikes): a 3-spread rule on means would cry wolf.
+#   daily MEDIANS: CNC_01 vibration >= +59, temperature >= +7.2, current >= +8.8; PUMP_03 rpm
+#                  >= 5.2 below; every other sensor of every machine within 0.55 (CONVEYOR_04 0.14).
+# 3.0 sits in that wide gap, and is the same "departed" level as baseline.DEPARTURE_SPREADS.
+# A single sensor is enough here (unlike live, where two are needed): one whole shifted day is far
+# stronger evidence than a minute of live readings, and PUMP_03's clog shows on rpm alone.
+HISTORY_SHIFT_SPREADS = 3.0
+HISTORY_DIRECTION = DRIFT_DIRECTION   # temperature, vibration and current up; rpm down
 
 
 # ---------------------------------------------------------------------------
@@ -497,4 +522,108 @@ def detect_patterns(machine_id, window, baseline, window_s=PATTERN_WINDOW_S):
                   "baseline_current": statistics.mean(centres["current_A"]),
                   "window_s": span, "n_points": n},
     ))
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# History shift (3E)
+# ---------------------------------------------------------------------------
+def _daily_series(sensor, info):
+    """(days, medians) of one sensor from the baseline; ValueError if they are damaged."""
+    days, medians = info.get("daily_days"), info.get("daily_medians")
+    if not isinstance(days, list) or not isinstance(medians, list) or not days or len(days) != len(medians):
+        raise ValueError(f"{sensor}: daily_days and daily_medians must be two non-empty lists of the same length")
+    for day in days:
+        if isinstance(day, bool) or not isinstance(day, int):
+            raise ValueError(f"{sensor}: day numbers must be whole numbers, got {day!r}")
+    if days != sorted(set(days)):
+        raise ValueError(f"{sensor}: day numbers must be increasing")
+    for value in medians:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{sensor}: non-numeric daily median {value!r}")
+    return days, medians
+
+
+def detect_history_shift(machine_id, baseline):
+    """
+    Has the machine's typical level moved away from normal on the most recent full day?
+    Uses only the daily statistics stored by baseline.py, so it runs once, at startup.
+
+    For each sensor, on the newest full day of history:
+      shift = (daily median - normal) / history spread, counted in the harmful direction
+      normal = reference_center (the reference-window median, or the nominal value for a sensor
+               that was already drifting inside the reference window)
+    It triggers at shift >= HISTORY_SHIFT_SPREADS, provided that day lies after the reference
+    window (the days inside it defined normal).
+
+    Returns one Signal per sensor (detector="history"), or an EMPTY list if it cannot be
+    evaluated ("not evaluated", NOT "all clear"): the baseline has no daily medians (a file
+    saved before this check existed) or no full day after the reference window.
+    Raises KeyError for an unknown machine and ValueError for damaged daily statistics.
+    """
+    machine = baseline["machines"][machine_id]
+    sensors = machine["sensors"]
+    meta = baseline.get("meta") if isinstance(baseline.get("meta"), dict) else {}
+    reference_days = meta.get("reference_days")
+    if not isinstance(reference_days, int) or any("daily_medians" not in sensors[s] for s in SENSOR_FIELDS):
+        return []
+
+    signals = []
+    for sensor in SENSOR_FIELDS:
+        info = sensors[sensor]
+        days, medians = _daily_series(sensor, info)
+        latest_day = days[-1]
+        if latest_day <= reference_days:
+            return []   # every day is part of the reference window: nothing to compare yet
+
+        normal = info["reference_center"]
+        spread = info["reference_spread"]
+        if not spread > 0:
+            raise ValueError(f"{sensor}: non-positive spread; the baseline file is damaged")
+        sign = 1.0 if HISTORY_DIRECTION[sensor] == "high" else -1.0
+        shifts = [sign * (median - normal) / spread for median in medians]
+        shift = shifts[-1]
+
+        # First day of the unbroken run of shifted days that ends with the newest day.
+        since_day = None
+        for day, day_shift in zip(reversed(days), reversed(shifts)):
+            if day_shift < HISTORY_SHIFT_SPREADS:
+                break
+            since_day = day
+        # The trend quoted in explanations: the whole history for a sensor that was already
+        # drifting in the reference window, otherwise from the last normal day onwards.
+        first = days[0] if info["drifting_in_window"] or since_day is None else max(days[0], since_day - 1)
+        series_days = [day for day in days if day >= first]
+        series = [median for day, median in zip(days, medians) if day >= first]
+        slope = fit_line(series_days, series)[0] if len(series) >= 2 else None
+
+        end_of_day = None
+        if machine.get("reference_start"):
+            end_of_day = (parse_timestamp(machine["reference_start"]) + timedelta(days=latest_day)).isoformat()
+
+        signals.append(Signal(
+            machine_id=machine_id,
+            detector="history",
+            sensor=sensor,
+            triggered=shift >= HISTORY_SHIFT_SPREADS,
+            score=max(0.0, shift) / HISTORY_SHIFT_SPREADS,
+            timestamp=end_of_day,
+            evidence={
+                "day": latest_day,
+                "median": medians[-1],
+                "normal": normal,
+                "normal_source": "nominal" if info["drifting_in_window"] else "reference median",
+                "change": medians[-1] - normal,
+                "change_pct": 100.0 * (medians[-1] - normal) / normal if normal else None,
+                "spread": spread,
+                "shift_spreads": shift,
+                "threshold_spreads": HISTORY_SHIFT_SPREADS,
+                "direction": HISTORY_DIRECTION[sensor],
+                "since_day": since_day,
+                "series_days": series_days,
+                "series": series,
+                "slope_per_day": slope,
+                "reference_days": reference_days,
+            },
+        ))
     return signals

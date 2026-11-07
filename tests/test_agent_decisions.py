@@ -181,17 +181,22 @@ class RecordedCaptureTest(unittest.TestCase):
                 self.assertEqual(alerts, expected_alerts)
                 self.assertEqual(levels, expected_levels)
                 for text in reasons:
-                    self.assertTrue(text.startswith(f"{machine}: sustained abnormal behaviour"))
-                    self.assertTrue(text.endswith("Inspection recommended."))
+                    self.assertTrue(text.startswith(f"{machine}: abnormal behaviour in the live stream. Likely cause: "))
+                    self.assertIn(". Evidence: ", text)
+                    self.assertIn(". Suggested check: ", text)
+                    self.assertNotIn("risk score", text)   # an unexplained number; it stays in the log only
+                    self.assertNotIn("<", text)            # the simulator's dashboard shows reasons as HTML
 
-    def test_explanations_quote_the_measurements(self):
+    def test_explanations_name_a_likely_cause_and_quote_the_measurements(self):
         baseline = helpers.fixture_baseline()
         _, _, (cnc02,) = replay(MachineMonitor("CNC_02", baseline), helpers.fixture_capture("CNC_02"))
-        self.assertIn("temperature_C and current_A were abnormal at the same time", cnc02)
-        self.assertIn("vs normal 68.0", cnc02)   # CNC_02's learned normal temperature
+        self.assertIn("Likely cause: overheating under load (thermal runaway).", cnc02)
+        self.assertIn("temperature and motor current high at the same moment in 80% of the last 120 s", cnc02)
+        self.assertIn("normal 68.0", cnc02)   # CNC_02's learned normal temperature
         _, _, (pump,) = replay(MachineMonitor("PUMP_03", baseline), helpers.fixture_capture("PUMP_03"))
-        self.assertIn("vibration_mm_s and current_A were abnormal at the same time", pump)
-        self.assertIn("more variable than normal", pump)
+        self.assertIn("Likely cause: cavitation or intermittent mechanical shocks.", pump)
+        self.assertIn("vibration and motor current high at the same moment", pump)
+        self.assertIn("more erratic than normal", pump)
 
 
 class HealthyStreamTest(unittest.TestCase):

@@ -83,7 +83,8 @@ class HandleResultTest(unittest.TestCase):
         fake_post, text = self.handle(alert_result(M), dry_run=False, post_answer={"id": "ALERT-7"})
         base_url, machine, reason, latest = fake_post.call_args.args
         self.assertEqual((base_url, machine, latest["machine_id"]), (URL, M, M))
-        self.assertIn("temperature_C was abnormal in 90% of the last 60 s (latest 80.0 C vs normal 70.0)", reason)
+        self.assertIn("temperature above its normal range in 90% of the last 60 s (latest 80.0 C, normal 70.0)", reason)
+        self.assertIn("Likely cause: thermal stress or a cooling failure.", reason)   # temperature alone
         self.assertIn("ALERT SENT id=ALERT-7", text)
         self.assertEqual((self.monitor.stats["alerts"], self.monitor.last_alert_time), (1, START))
 

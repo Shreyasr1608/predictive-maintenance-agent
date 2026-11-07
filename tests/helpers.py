@@ -64,6 +64,27 @@ def make_baseline(centres=None, spreads=None, medians=None, drifting=(), hourly=
     return {"meta": {"source": "tests"}, "machines": {machine: {"sensors": sensors}}}
 
 
+def make_history_baseline(medians=None, centres=None, spreads=None, drifting=(), reference_days=4,
+                          machine=TEST_MACHINE):
+    """
+    make_baseline() plus the daily statistics the history check reads.
+      medians        : {sensor: one daily median per day, oldest first}; sensors not given sit at
+                       their centre on every day (7 days, or as many as the given lists have)
+      spreads        : history spreads; 1.0 unless given, so centre + 3.5 is a 3.5-spread shift
+      reference_days : how many of the first days formed the reference window
+    """
+    medians = medians or {}
+    spreads = dict({sensor: 1.0 for sensor in SENSOR_FIELDS}, **(spreads or {}))
+    base = make_baseline(centres=centres, spreads=spreads, drifting=drifting, machine=machine)
+    base["meta"]["reference_days"] = reference_days
+    n_days = len(next(iter(medians.values()))) if medians else 7
+    for sensor, info in base["machines"][machine]["sensors"].items():
+        series = list(medians.get(sensor, [info["reference_center"]] * n_days))
+        info["daily_days"] = list(range(1, len(series) + 1))
+        info["daily_medians"] = series
+    return base
+
+
 def reading(moment, machine=TEST_MACHINE, **values):
     """A valid reading at `moment`; sensors that are not given sit at their CENTRES value."""
     result = {"machine_id": machine, "timestamp": iso(moment), "status": "running"}

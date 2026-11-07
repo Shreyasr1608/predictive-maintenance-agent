@@ -24,6 +24,16 @@ How a decision is made (all numbers are settings below):
   * After an alert, that machine is silent for COOLDOWN_S.
   * If posting fails, no cooldown starts, so the alert is retried at the next evaluation.
 
+History check (once, at startup): detector.detect_history_shift compares each sensor's median
+on the newest full day of the 7-day history with normal. A shift of HISTORY_SHIFT_SPREADS or
+more in the harmful direction is slow, multi-day degradation the live stream cannot show
+(CNC_01's bearing wear, PUMP_03's falling rpm). It produces at most ONE alert per machine per
+run, sent before streaming starts and retried until a POST succeeds. It neither uses nor starts
+the live cooldown: it is about days, the live rules are about minutes.
+
+Every alert names a likely cause (chosen from the evidence, never from the machine's name), the
+measured evidence and a suggested check.
+
 Usage:
   python agent.py                      # monitor until Ctrl+C
   python agent.py --dry-run            # decide and log, but do NOT post alerts
@@ -45,7 +55,7 @@ import requests
 
 from baseline import build_from_server, load_baseline, save_baseline
 from common import DEFAULT_BASE_URL, SimulatorError, check_reading, parse_timestamp
-from detector import detect_drift, detect_patterns, detect_spikes
+from detector import detect_drift, detect_history_shift, detect_patterns, detect_spikes
 
 log = logging.getLogger("agent")
 
@@ -85,6 +95,9 @@ STREAM_READ_TIMEOUT_S = 10   # readings arrive every ~1 s, so 10 s of silence me
 POST_TIMEOUT_S = 10
 
 SENSOR_UNITS = {"temperature_C": "C", "vibration_mm_s": "mm/s", "rpm": "rpm", "current_A": "A"}
+SENSOR_NAMES = {"temperature_C": "temperature", "vibration_mm_s": "vibration", "rpm": "speed",
+                "current_A": "motor current"}
+DECIMALS = {"temperature_C": 1, "vibration_mm_s": 2, "rpm": 0, "current_A": 1}   # in alert texts
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +172,24 @@ class MachineMonitor:
         self.low_streak = 0         # consecutive evaluations below "high"
         self.last_alert_time = None
         self.stats = Counter()
+        # History check: computed once from the baseline's daily statistics (no network).
+        self.history_signals, self.history_note = self._check_history()
+        self.history_evidence = tuple(
+            Evidence("history", s.sensor, (s.sensor,), s.score, s.evidence)
+            for s in self.history_signals if s.triggered)
+        self.history_alert_sent = False
+
+    def _check_history(self):
+        """Run the history check. Returns (signals, note). Never raises: a damaged history part
+        of the baseline must not stop the live monitoring."""
+        try:
+            signals = detect_history_shift(self.machine_id, self.baseline)
+        except (KeyError, TypeError, ValueError) as exc:
+            return (), f"not evaluated: damaged daily statistics in the baseline ({type(exc).__name__}: {exc})"
+        if not signals:
+            return (), ("not evaluated: the baseline has no daily medians (a file saved before this check "
+                        "existed?) or no full day after the reference window")
+        return tuple(signals), "evaluated"
 
     # -- input -------------------------------------------------------------
     def add_reading(self, reading):
@@ -286,34 +317,162 @@ class MachineMonitor:
         self.last_alert_time = now
         self.stats["alerts"] += 1
 
+    # -- the history alert (at most once per run) --------------------------------
+    def history_alert_due(self):
+        """True while the history check found a shift and no alert about it has been sent yet."""
+        return bool(self.history_evidence) and not self.history_alert_sent
+
+    def confirm_history_alert(self):
+        """Call after the history alert was POSTed successfully (or logged in a dry run).
+        Deliberately leaves the live cooldown alone."""
+        self.history_alert_sent = True
+        self.stats["history_alerts"] += 1
+
 
 # ---------------------------------------------------------------------------
-# Alert text, built only from the measured evidence (run_agent's explain= argument can swap it)
+# Alert text, built only from the measured evidence (run_agent's explain= and explain_history=
+# arguments can swap it). No claims of certain failure. Never put "<" in it: the simulator's
+# dashboard inserts the reason into its page as HTML.
 # ---------------------------------------------------------------------------
+# Likely causes: key -> (cause, what to check). The wording starts from the assignment's own
+# sensor table (rising temperature = thermal stress or cooling failure, increasing vibration =
+# bearing wear, rpm drift = load or mechanical issue, high current = motor overload) and adds
+# common combinations of those signs. A cause is chosen from the EVIDENCE, never from the
+# machine's name. It is a hint for the person who inspects the machine, not a diagnosis: the
+# agent sees four sensors only.
+LIKELY_CAUSES = {
+    "thermal_runaway": ("overheating under load (thermal runaway)", "cooling (coolant flow, fans) and machine load"),
+    "cavitation": ("cavitation or intermittent mechanical shocks", "inlet side (blockage, trapped air) and mountings"),
+    "friction": ("friction heating, such as a failing bearing or poor lubrication", "lubrication and bearings"),
+    "bearing_wear": ("bearing wear", "bearing condition and lubrication"),
+    "wear_or_imbalance": ("bearing wear or imbalance", "bearings and balance of rotating parts"),
+    "clog": ("a growing restriction or load slowing the machine, such as a developing clog",
+             "blockage at the inlet, filter or impeller, or a dragging drive"),
+    "cooling": ("thermal stress or a cooling failure", "cooling system"),
+    "overload": ("motor overload", "machine load and motor"),
+    "speed": ("speed instability (a load or drive problem)", "drive and load"),
+    "shocks": ("mechanical shocks or looseness", "mountings and rotating parts"),
+    "unknown": ("unclear; several sensors are abnormal", "the whole machine"),
+}
+MAX_CAUSES = 2
+
+
+def live_causes(evidence):
+    """Likely-cause keys (LIKELY_CAUSES) for live evidence, most specific first."""
+    names = {(item.detector, item.name) for item in evidence}
+    pairs = {item.detail.get("dominant_pair") for item in evidence if item.name == "co_elevation"}
+
+    def on(sensor):
+        return any(sensor in item.sensors for item in evidence)
+
+    keys = []
+    if on("temperature_C") and on("current_A"):
+        keys.append("thermal_runaway")
+    if ("pattern", "vibration_variability") in names:
+        keys.append("cavitation")
+    if "temperature_C+vibration_mm_s" in pairs:
+        keys.append("friction")
+    if ("pattern", "rpm_decline_with_current") in names or ("drift", "rpm") in names:
+        keys.append("clog")
+    if ("drift", "vibration_mm_s") in names:
+        keys.append("wear_or_imbalance")
+    # The single-sensor causes only when nothing more specific already explains that sensor.
+    if on("temperature_C") and not {"thermal_runaway", "friction"} & set(keys):
+        keys.append("cooling")
+    if on("current_A") and not {"thermal_runaway", "cavitation", "clog"} & set(keys):
+        keys.append("overload")
+    if ("spike", "rpm") in names and "clog" not in keys:
+        keys.append("speed")
+    if on("vibration_mm_s") and not {"cavitation", "friction", "wear_or_imbalance"} & set(keys):
+        keys.append("shocks")
+    return keys[:MAX_CAUSES] or ["unknown"]
+
+
+def history_causes(evidence):
+    """Likely-cause keys for history evidence (the sensors whose daily level has shifted)."""
+    shifted = {item.name for item in evidence}
+    keys = []
+    if "vibration_mm_s" in shifted:
+        keys.append("bearing_wear" if shifted & {"temperature_C", "current_A"} else "wear_or_imbalance")
+    if "rpm" in shifted:
+        keys.append("clog")
+    if "vibration_mm_s" not in shifted:
+        if {"temperature_C", "current_A"} <= shifted:
+            keys.append("thermal_runaway")
+        elif "temperature_C" in shifted:
+            keys.append("cooling")
+        elif "current_A" in shifted and "rpm" not in shifted:
+            keys.append("overload")
+    return keys[:MAX_CAUSES] or ["unknown"]
+
+
+def _causes_text(keys):
+    """('cause A; or cause B', 'check A; check B') for the alert text."""
+    return ("; or ".join(LIKELY_CAUSES[k][0] for k in keys), "; ".join(LIKELY_CAUSES[k][1] for k in keys))
+
+
+def _value(sensor, value):
+    return f"{value:.{DECIMALS[sensor]}f}"
+
+
 def _describe(item):
+    """One piece of live evidence in plain words, with the measured numbers."""
     d = item.detail
-    unit = SENSOR_UNITS.get(item.name, "")
     if item.detector == "spike":
-        return (f"{item.name} was abnormal in {d['share']:.0%} of the last {d['lookback_s']} s "
-                f"(latest {d['value']:.1f} {unit} vs normal {d['baseline']:.1f}).")
+        side = {"both": "outside", "low": "below"}.get(d.get("direction"), "above")
+        return (f"{SENSOR_NAMES[item.name]} {side} its normal range in {d['share']:.0%} of the last "
+                f"{d['lookback_s']} s (latest {_value(item.name, d['value'])} {SENSOR_UNITS[item.name]}, "
+                f"normal {_value(item.name, d['baseline'])})")
     if item.detector == "drift":
-        return (f"{item.name} is trending {d['direction']}: {d['change']:+.2f} {unit} over "
-                f"{d['window_s']:.0f} s ({d['slope_per_min']:+.3f} {unit}/min).")
+        return (f"{SENSOR_NAMES[item.name]} {'rising' if d['change'] > 0 else 'falling'} steadily: "
+                f"{d['change']:+.{DECIMALS[item.name]}f} {SENSOR_UNITS[item.name]} over the last {d['window_s']:.0f} s")
     if item.name == "vibration_variability":
-        return (f"vibration is {d['ratio']:.1f}x more variable than normal "
-                f"(std {d['std']:.2f} mm/s over {d['window_s']:.0f} s).")
+        return (f"vibration {d['ratio']:.1f}x more erratic than normal "
+                f"(std {d['std']:.2f} mm/s over the last {d['window_s']:.0f} s)")
     if item.name == "co_elevation":
-        return (f"{' and '.join(item.sensors)} were abnormal at the same time in {d['share']:.0%} "
-                f"of the last {d['window_s']:.0f} s.")
-    return (f"rpm {d['mean_rpm']:.0f} vs normal {d['baseline_rpm']:.0f} with current "
-            f"{d['mean_current']:.1f} A vs normal {d['baseline_current']:.1f} A.")
+        sensors = " and ".join(SENSOR_NAMES[s] for s in item.sensors) or "two or more sensors"
+        return f"{sensors} high at the same moment in {d['share']:.0%} of the last {d['window_s']:.0f} s"
+    return (f"speed {d['mean_rpm']:.0f} rpm vs normal {d['baseline_rpm']:.0f} while motor current is "
+            f"{d['mean_current']:.1f} A vs normal {d['baseline_current']:.1f}")
 
 
 def simple_reason(assessment):
-    """A short, factual explanation built from the real measurements. No claims of certain failure."""
-    parts = [_describe(item) for item in sorted(assessment.evidence, key=lambda e: -e.score)]
-    return (f"{assessment.machine_id}: sustained abnormal behaviour (risk score {assessment.risk_score:.1f}). "
-            + " ".join(parts) + " Inspection recommended.")
+    """Live alert text: likely cause, the measured evidence (strongest first), what to check."""
+    causes, checks = _causes_text(live_causes(assessment.evidence))
+    facts = "; ".join(_describe(item) for item in sorted(assessment.evidence, key=lambda e: -e.score))
+    return (f"{assessment.machine_id}: abnormal behaviour in the live stream. Likely cause: {causes}. "
+            f"Evidence: {facts}. Suggested check: {checks}.")
+
+
+def _describe_history(item, with_trend):
+    """One shifted sensor from the history check. with_trend (used for the strongest sensor)
+    adds the day-by-day medians and since when the shift has held without a break."""
+    d, sensor = item.detail, item.name
+    unit = SENSOR_UNITS[sensor]
+    text = (f"{SENSOR_NAMES[sensor]} {_value(sensor, d['median'])} {unit} vs "
+            f"{'nominal' if d['normal_source'] == 'nominal' else 'normal'} {_value(sensor, d['normal'])}")
+    if d["change_pct"] is not None:
+        text += f" ({d['change_pct']:+.0f}%)"
+    if not with_trend:
+        return text
+    if len(d["series"]) >= 2:
+        text += (f", day {d['series_days'][0]} to {d['series_days'][-1]}: "
+                 + " -> ".join(_value(sensor, v) for v in d["series"]))
+        if d["slope_per_day"] is not None:
+            text += f" (about {d['slope_per_day']:+.{DECIMALS[sensor]}f} {unit} per day)"
+    if d["since_day"] is not None:
+        text += f", {'above' if d['direction'] == 'high' else 'below'} normal since day {d['since_day']}"
+    return text
+
+
+def history_reason(machine_id, evidence):
+    """History alert text: likely cause, the shifted daily levels (strongest first), what to check."""
+    causes, checks = _causes_text(history_causes(evidence))
+    ordered = sorted(evidence, key=lambda e: -e.score)
+    facts = "; ".join(_describe_history(item, with_trend=(i == 0)) for i, item in enumerate(ordered))
+    days = max(item.detail["day"] for item in evidence)
+    return (f"{machine_id}: warning from the {days}-day history. Likely cause: {causes}. "
+            f"Evidence (daily medians): {facts}. Suggested check: {checks}.")
 
 
 # ---------------------------------------------------------------------------
@@ -402,11 +561,35 @@ def handle_result(monitor, result, base_url, dry_run, explain):
     log.warning("machine=%s ALERT SENT id=%s reason=%s", assessment.machine_id, stored.get("id"), reason)
 
 
-def run_machine(base_url, monitor, stop_event, dry_run, explain):
-    """Thread body: stream one machine until stopped, reconnecting whenever the stream drops."""
+def send_history_alert(monitor, base_url, dry_run, explain_history):
+    """
+    Send this machine's history alert if one is due: at most once per run, retried at the next
+    call until a POST succeeds. A dry run only logs it. No live reading caused it, so no reading
+    is attached (the field is optional). The live cooldown is neither checked nor started.
+    """
+    if not monitor.history_alert_due():
+        return
+    reason = explain_history(monitor.machine_id, monitor.history_evidence)
+    if dry_run:
+        log.warning("machine=%s DRY RUN, would alert (history): %s", monitor.machine_id, reason)
+        monitor.confirm_history_alert()
+        return
+    stored = post_alert(base_url, monitor.machine_id, reason, None)
+    if stored is None:
+        log.error("machine=%s history alert NOT sent; will retry", monitor.machine_id)
+        return
+    monitor.confirm_history_alert()
+    log.warning("machine=%s ALERT SENT (history) id=%s reason=%s", monitor.machine_id, stored.get("id"), reason)
+
+
+def run_machine(base_url, monitor, stop_event, dry_run, explain, explain_history=history_reason):
+    """Thread body: send the history alert if due, then stream one machine until stopped,
+    reconnecting whenever the stream drops."""
     attempt = 0
     while not stop_event.is_set():
         try:
+            # First thing on every (re)connection; does nothing once the history alert is sent.
+            send_history_alert(monitor, base_url, dry_run, explain_history)
             for text in read_stream_lines(base_url, monitor.machine_id, stop_event):
                 try:
                     reading = json.loads(text)
@@ -419,6 +602,8 @@ def run_machine(base_url, monitor, stop_event, dry_run, explain):
                     result = monitor.evaluate_if_due()
                     if result is not None:
                         handle_result(monitor, result, base_url, dry_run, explain)
+                        # Retry a history alert whose POST failed, at the live retry rhythm.
+                        send_history_alert(monitor, base_url, dry_run, explain_history)
             if not stop_event.is_set():
                 log.warning("machine=%s stream closed by the server", monitor.machine_id)
         except requests.exceptions.RequestException as exc:
@@ -455,23 +640,43 @@ SHUTDOWN_WAIT_S = 15
 MAIN_LOOP_NAP_S = 0.5
 
 
-def run_agent(base_url, baseline, dry_run=False, duration=None, explain=simple_reason):
+def log_history_check(monitor):
+    """One startup line per machine with the verdict of the history check."""
+    machine_id = monitor.machine_id
+    if not monitor.history_signals:
+        log.warning("machine=%s history check %s", machine_id, monitor.history_note)
+    elif monitor.history_evidence:
+        found = "; ".join(
+            f"{item.name} {item.detail['shift_spreads']:+.1f} spreads (day {item.detail['day']} median "
+            f"{item.detail['median']:g} vs normal {item.detail['normal']:g})" for item in monitor.history_evidence)
+        log.warning("machine=%s history check: SHIFT found: %s", machine_id, found)
+    else:
+        top = max(monitor.history_signals, key=lambda s: s.evidence["shift_spreads"])
+        log.info("machine=%s history check: no sustained shift (largest: %s %+.1f spreads; alert at %.1f)",
+                 machine_id, top.sensor, top.evidence["shift_spreads"], top.evidence["threshold_spreads"])
+
+
+def run_agent(base_url, baseline, dry_run=False, duration=None, explain=simple_reason,
+              explain_history=history_reason):
     """
     Monitor every machine in the baseline, one thread per machine, until Ctrl+C, until
     `duration` seconds (wall clock) have passed, or until every thread has stopped.
-    explain(assessment) -> str builds the alert text (default: simple_reason).
+    explain(assessment) -> str builds the live alert text (default: simple_reason);
+    explain_history(machine_id, evidence) -> str the history alert text (default: history_reason).
     Returns {machine_id: MachineMonitor}, so the caller can print a summary (and tests can
     look at the counters).
     """
     stop_event = threading.Event()  # the shared "please stop" flag that every thread checks
     monitors = {machine_id: MachineMonitor(machine_id, baseline) for machine_id in baseline["machines"]}
+    for monitor in monitors.values():
+        log_history_check(monitor)
     threads = []
     try:
         for machine_id, monitor in monitors.items():
             # daemon=True: a thread that is still stuck when the program ends cannot keep the
             # program alive.
             thread = threading.Thread(target=run_machine, name=machine_id, daemon=True,
-                                      args=(base_url, monitor, stop_event, dry_run, explain))
+                                      args=(base_url, monitor, stop_event, dry_run, explain, explain_history))
             thread.start()
             threads.append(thread)
         log.info("monitoring %d machines: %s", len(threads), ", ".join(monitors))
@@ -504,14 +709,15 @@ def print_summary(monitors, dry_run=False):
     """
     Log one line of counters per machine (so it reaches both the console and the log file):
       readings, evaluations   accepted readings, and how often the detectors ran
-      alerts                  alerts sent; in a dry run, alerts that WOULD have been sent
+      alerts                  live alerts sent; in a dry run, alerts that WOULD have been sent
+      history_alerts          history alerts sent (at most 1 per run); in a dry run, would-be ones
       malformed, out_of_order rejected stream lines and readings (warnings in the log say why)
       gaps                    silences longer than MAX_GAP_S between two readings
       reconnects              times the stream was opened again (or tried) after it ended
       stream_errors           connection problems: refused, timed out, broken, bad HTTP status
       unexpected_errors       exceptions caught by the last-resort handler (tracebacks in the log)
     """
-    keys = ("readings", "evaluations", "alerts", "malformed", "out_of_order", "gaps",
+    keys = ("readings", "evaluations", "alerts", "history_alerts", "malformed", "out_of_order", "gaps",
             "reconnects", "stream_errors", "unexpected_errors")
     log.info("Summary%s:", " (DRY RUN: 'alerts' are alerts that would have been sent)" if dry_run else "")
     for machine_id, monitor in monitors.items():
