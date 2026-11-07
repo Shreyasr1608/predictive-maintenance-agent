@@ -1,7 +1,7 @@
 """
-try_detectors.py -- replay the recorded live CSVs through the detectors.
+try_detector.py -- replay the recorded live CSVs through the detectors.
 
-A quick end-to-end look, NOT the Phase 8 test suite. It needs:
+A quick look at the detectors on real data, NOT the test suite (that is tests/). It needs:
   * baseline.json         (from `python baseline.py`)
   * data/live_<machine>.csv   (from `python capture_live.py`)
 

@@ -2,8 +2,8 @@
 baseline.py -- Phase 2: learn what "normal" looks like for each machine.
 
 This file only LEARNS from history. It never reads the live stream and never decides
-whether anything is anomalous. detectors.py (Phase 3) will read the baseline.json
-that this script writes.
+whether anything is anomalous. detector.py (Phase 3) uses the baseline built here
+(agent.py rebuilds it at startup; this script writes baseline.json for inspection).
 
 What Phase 1 taught us, and how it shapes this file:
   * The 7-day history is NOT a clean "normal week": faults are baked into the later days
@@ -38,7 +38,7 @@ from common import (
 )
 
 # ---------------------------------------------------------------------------
-# Settings (these move into config.py in Phase 7)
+# Settings (README.md, "Configuration and thresholds", lists every value and its reason)
 # ---------------------------------------------------------------------------
 # How many of the OLDEST days count as "healthy reference". Evidence: the report's daily
 # table shows the first sensor to leave its normal level does so on day 5 (CNC_01).

@@ -50,7 +50,7 @@ from detector import detect_drift, detect_patterns, detect_spikes
 log = logging.getLogger("agent")
 
 # ---------------------------------------------------------------------------
-# Settings (these move into config.py in Phase 7)
+# Settings (README.md, "Configuration and thresholds", lists every value and its reason)
 # ---------------------------------------------------------------------------
 EVAL_INTERVAL_S = 5          # run the detectors about every 5 seconds of data time
 WINDOW_KEEP_S = 360          # readings kept per machine: the drift window (300 s) plus margin
@@ -288,7 +288,7 @@ class MachineMonitor:
 
 
 # ---------------------------------------------------------------------------
-# Alert text (Phase 5 replaces this with a richer explain.py; the hook stays the same)
+# Alert text, built only from the measured evidence (run_agent's explain= argument can swap it)
 # ---------------------------------------------------------------------------
 def _describe(item):
     d = item.detail
@@ -321,7 +321,8 @@ def simple_reason(assessment):
 # ---------------------------------------------------------------------------
 def post_alert(base_url, machine_id, reason, reading):
     """
-    POST /alert. Returns the stored alert (a dict) on success, or None on any failure.
+    POST /alert. Returns the stored alert (a dict) on success, or None on failure; after a
+    failure no cooldown starts, so the agent tries again at the next evaluation.
     Contract (read from server.js in Phase 1): body {machine_id, reason, reading?},
     answer HTTP 201 {success: true, alert: {...}}.
     """
@@ -337,11 +338,18 @@ def post_alert(base_url, machine_id, reason, reading):
     if response.status_code != 201:
         log.error("machine=%s POST /alert returned HTTP %s: %s", machine_id, response.status_code, response.text[:200])
         return None
+    # HTTP 201 means the server stored the alert. An unexpected answer body must not make the
+    # agent send it again (that would store a duplicate), so it only costs us the alert id.
     try:
-        return response.json().get("alert", {})
+        answer = response.json()
     except ValueError:
-        log.error("machine=%s POST /alert: answer was not valid JSON", machine_id)
-        return None
+        answer = None
+    alert = answer.get("alert") if isinstance(answer, dict) else None
+    if not isinstance(alert, dict):
+        log.warning("machine=%s POST /alert: HTTP 201 but unexpected answer %r; counting the alert as sent",
+                    machine_id, response.text[:200])
+        return {}
+    return alert
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +448,7 @@ def run_machine(base_url, monitor, stop_event, dry_run, explain):
 # ---------------------------------------------------------------------------
 # When stopping, how long to wait for the machine threads in total. A thread can be waiting up
 # to STREAM_READ_TIMEOUT_S (10 s) for the next stream line, or finishing a POST that may take up
-# to POST_TIMEOUT_S (10 s). (Moves to config.py in Phase 7, like the settings at the top.)
+# to POST_TIMEOUT_S (10 s).
 SHUTDOWN_WAIT_S = 15
 # How often the main thread wakes up to check the --duration deadline. Short naps also make
 # Ctrl+C work promptly on Windows, where a long blocking wait can delay it.
@@ -451,7 +459,7 @@ def run_agent(base_url, baseline, dry_run=False, duration=None, explain=simple_r
     """
     Monitor every machine in the baseline, one thread per machine, until Ctrl+C, until
     `duration` seconds (wall clock) have passed, or until every thread has stopped.
-    explain(assessment) -> str builds the alert text (Phase 5 will pass a richer one).
+    explain(assessment) -> str builds the alert text (default: simple_reason).
     Returns {machine_id: MachineMonitor}, so the caller can print a summary (and tests can
     look at the counters).
     """

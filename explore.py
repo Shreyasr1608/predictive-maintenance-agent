@@ -46,7 +46,7 @@ import matplotlib.pyplot as plt
 import requests
 
 # ---------------------------------------------------------------------------
-# Settings (these move into config.py in Phase 7)
+# Settings
 # ---------------------------------------------------------------------------
 DEFAULT_BASE_URL = "http://localhost:3000"
 REQUEST_TIMEOUT = 10         # seconds to wait for a normal HTTP response

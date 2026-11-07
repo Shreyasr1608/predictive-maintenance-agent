@@ -1,11 +1,11 @@
 """
-detectors.py -- Phase 3: turn readings into evidence.
+detector.py -- Phase 3: turn readings into evidence.
 
-Built one detector at a time:
-  3A  spike detection     (done)
-  3B  drift detection     (done)
-  3C  pattern detection   <- added in this version
-  3D  Isolation Forest    (optional, last)
+Three detectors, built and checked one at a time:
+  3A  spike detection
+  3B  drift detection
+  3C  pattern detection
+(3D, an optional Isolation Forest, was deliberately not built; see README.md.)
 
 Every detector returns Signal objects with the same shape, so the agent (Phase 4) can combine
 them. A detector only produces evidence. It never posts alerts and never decides on its own
@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from common import SENSOR_FIELDS, check_reading, parse_timestamp
 
 # ---------------------------------------------------------------------------
-# Settings (these move into config.py in Phase 7)
+# Settings (README.md, "Configuration and thresholds", lists every value and its reason)
 # ---------------------------------------------------------------------------
 # Typical live wobble of each sensor, in the sensor's own units. It is the same for every
 # machine, because the simulator adds the same absolute noise to all of them.
@@ -146,7 +146,7 @@ class Signal:
                  up evidence from different detectors on one scale.
     timestamp  : timestamp of the reading that produced the signal
     evidence   : the actual numbers behind the decision (value, baseline, spread, z, ...),
-                 so explain.py can quote real measurements instead of guessing.
+                 so the alert text can quote real measurements instead of guessing.
     """
     machine_id: str
     detector: str

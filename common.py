@@ -1,15 +1,14 @@
 """
-common.py -- small helpers shared by baseline.py, detectors.py, agent.py, ...
+common.py -- small helpers shared by baseline.py, detector.py, agent.py, ...
 
 Deliberately light: only `requests` is imported, so the agent never needs matplotlib.
 
-Note: explore.py (Phase 1) has its own copies of parse_timestamp / check_reading.
-It already works and was verified against the real simulator, so I did not touch it.
-We merge the duplicates in the final cleanup (Phase 9).
+Note: explore.py (Phase 1) has its own older copies of parse_timestamp / check_reading.
+It was verified against the real simulator as it is, so it was left unchanged.
 """
 
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -60,12 +59,17 @@ def get_json(base_url, path):
 def parse_timestamp(text):
     """
     '2026-10-28T13:20:42.477Z' -> timezone-aware datetime in UTC.
-    fromisoformat() wants '+00:00' instead of 'Z', so we swap it.
-    Raises ValueError if the text cannot be parsed.
+    fromisoformat() wants '+00:00' instead of 'Z', so we swap it. Any other UTC offset is
+    converted to UTC, because the hour-of-day baselines are in UTC.
+    Raises ValueError if the text cannot be parsed or carries no time zone at all (such a
+    "naive" time cannot be compared with the others and would crash the comparison later).
     """
     if not isinstance(text, str):
         raise ValueError(f"timestamp is {type(text).__name__}, not text")
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        raise ValueError(f"timestamp has no time zone: {text!r}")
+    return moment.astimezone(timezone.utc)
 
 
 def check_reading(reading):
